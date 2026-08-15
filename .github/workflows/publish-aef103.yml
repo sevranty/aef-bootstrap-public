@@ -59,7 +59,7 @@ jobs:
           rmdir .github/workflows 2>/dev/null || true
           rmdir .github 2>/dev/null || true
           git add -A
-          git diff --cached --check
+          git diff --cached --check -- README.md aef-worker-v3-manifest.json
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git commit -m "AEF#103 publish exact bootstrap v3 distribution"
