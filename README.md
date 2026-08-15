@@ -6,25 +6,36 @@ Source of truth remains private:
 https://github.com/sevranty/agent-execution-fabric
 
 Parent task:
-https://github.com/sevranty/agent-execution-fabric/issues/103
+https://github.com/sevranty/agent-execution-fabric/issues/126
+
+Activation task:
+https://github.com/sevranty/agent-execution-fabric/issues/61
 
 Publication task:
-https://github.com/sevranty/aef-bootstrap-public/issues/1
+https://github.com/sevranty/aef-bootstrap-public/issues/3
 
 ## Bootstrap v3
 
 Source AEF merge:
-e283004d3e1d39f4487fdb84d1c6147ba79bf611
+b36dfe677d446d77d093ec9975aaca75515c613d
 
-Source validation run:
-31913055312
+Source full validation run:
+31914973768
+
+Source one-shot validation run:
+31914973820
 
 Source artifact:
-9254192183
+9254661301
 
 Published files:
-- aef-worker-v3.yaml: 80900 bytes, SHA-256 6c052d8122fad68fa234147078d7fc640bff307cc261282fb7e39c182d00bb53
-- aef-worker-v3-manifest.json: 784 bytes, SHA-256 8ff5722d35f89c58f0c57d68ab52a25b1d376c9ab3967d5781f1c682a8baeb49
+- aef-worker-v3.yaml: 81936 bytes, SHA-256 ac1ee32fb5fa1b50a2a4fc5858bb149410580ddd73a6b1a6ff5252a251d6e2a8
+- aef-worker-v3-manifest.json: 784 bytes, SHA-256 c27753fa5fdadafa43ddac749c23bea95fd00ee496c4fe3ed13888b87ecc6157
+
+This publication incorporates AEF#126 provider parity:
+- canonical Ubuntu 24.04 `/etc/os-release -> ../usr/lib/os-release` is accepted only when it resolves to the exact canonical target;
+- arbitrary symlink targets fail closed;
+- DigitalOcean provider `#include` payloads are generated without a terminal newline so owner input and provider metadata have the same byte identity.
 
 Security boundary:
 - generated bootstrap distribution only
