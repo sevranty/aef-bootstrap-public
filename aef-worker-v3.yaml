@@ -160,10 +160,39 @@ write_files:
         state("RUNNING", manifest)
     
     
-    def verify_os() -> None:
-        path = rp("/etc/os-release")
-        if path.is_symlink() or not path.is_file():
+    def _os_release_path() -> Path:
+        etc_path = rp("/etc/os-release")
+        usr_path = rp("/usr/lib/os-release")
+        try:
+            etc_observed = os.lstat(etc_path)
+        except OSError:
             fail("OS_RELEASE_INVALID")
+        if stat.S_ISLNK(etc_observed.st_mode):
+            try:
+                resolved = etc_path.resolve(strict=True)
+                expected = usr_path.resolve(strict=True)
+            except OSError:
+                fail("OS_RELEASE_INVALID")
+            if resolved != expected:
+                fail("OS_RELEASE_SYMLINK_TARGET_INVALID", str(resolved))
+            path = expected
+        elif stat.S_ISREG(etc_observed.st_mode):
+            path = etc_path
+        else:
+            fail("OS_RELEASE_INVALID")
+        try:
+            observed = os.lstat(path)
+        except OSError:
+            fail("OS_RELEASE_INVALID")
+        if not stat.S_ISREG(observed.st_mode) or stat.S_ISLNK(observed.st_mode):
+            fail("OS_RELEASE_TARGET_INVALID")
+        if stat.S_IMODE(observed.st_mode) & 0o022:
+            fail("OS_RELEASE_TARGET_WRITABLE")
+        return path
+    
+    
+    def verify_os() -> None:
+        path = _os_release_path()
         values = {}
         for line in path.read_text(encoding="utf-8").splitlines():
             if "=" in line:
