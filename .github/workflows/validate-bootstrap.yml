@@ -1,0 +1,84 @@
+name: Validate public AEF bootstrap
+
+on:
+  pull_request:
+    branches:
+      - main
+    paths:
+      - aef-worker-v3.yaml
+      - aef-worker-v3-manifest.json
+      - README.md
+      - .github/workflows/validate-bootstrap.yml
+  push:
+    branches:
+      - main
+    paths:
+      - aef-worker-v3.yaml
+      - aef-worker-v3-manifest.json
+      - README.md
+      - .github/workflows/validate-bootstrap.yml
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: Checkout exact revision
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+
+      - name: Verify public distribution contract
+        run: |
+          python3 - <<'PY'
+          import hashlib
+          import json
+          from pathlib import Path
+
+          yaml_path = Path("aef-worker-v3.yaml")
+          manifest_path = Path("aef-worker-v3-manifest.json")
+          data = yaml_path.read_bytes()
+          manifest_bytes = manifest_path.read_bytes()
+          manifest = json.loads(manifest_bytes.decode("ascii"))
+
+          required = {
+              "schema_version": 3,
+              "profile_id": "digitalocean-remote-cloud-config-v3",
+              "bootstrap_version": 3,
+              "provider": "digitalocean",
+              "provider_image_slug": "ubuntu-24-04-x64",
+              "format": "remote-cloud-config",
+              "credential_values_present": False,
+              "activation_performed": False,
+          }
+          for key, value in required.items():
+              if manifest.get(key) != value:
+                  raise SystemExit(f"manifest contract mismatch: {key}")
+
+          actual_sha = hashlib.sha256(data).hexdigest()
+          if len(data) != manifest.get("remote_cloud_config_bytes"):
+              raise SystemExit("bootstrap byte-count mismatch")
+          if actual_sha != manifest.get("remote_cloud_config_sha256"):
+              raise SystemExit("bootstrap SHA-256 mismatch")
+          if not data.startswith(b"#cloud-config\n"):
+              raise SystemExit("bootstrap is not cloud-config")
+
+          forbidden = (
+              b"-----BEGIN OPENSSH PRIVATE KEY-----",
+              b"-----BEGIN PRIVATE KEY-----",
+              b"github_pat_",
+              b"ghp_",
+              b"gho_",
+              b"ghu_",
+              b"ghs_",
+              b"ghr_",
+          )
+          for marker in forbidden:
+              if marker in data or marker in manifest_bytes:
+                  raise SystemExit(f"forbidden credential marker: {marker!r}")
+
+          print(f"PUBLIC_BOOTSTRAP_PASS bytes={len(data)} sha256={actual_sha}")
+          PY
