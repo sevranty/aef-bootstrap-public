@@ -1,0 +1,61 @@
+name: AEF#150 publish exact bootstrap v4
+
+on:
+  push:
+    branches:
+      - publish/aef-150-clean-bootstrap-v4
+    paths:
+      - .github/workflows/aef150-publish-v4.yml
+
+permissions:
+  contents: write
+
+jobs:
+  publish-exact-v4:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: Checkout publication branch
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: true
+
+      - name: Fetch and verify exact validated artifact
+        env:
+          ARTIFACT_URL: https://sdmntpritalynorth.oaiusercontent.com/files/00000000-3f74-8246-8844-a4902e607818/raw?se=2026-08-16T00%3A47%3A31Z&sp=r&sv=2026-02-06&sr=b&scid=38537de7-9582-5d09-a04d-49b0d23ab1c7&skoid=82a3371f-2f6c-4f81-8a78-2701b362559b&sktid=a48cca56-e6da-484e-a814-9c849652bcb3&skt=2026-08-15T21%3A21%3A54Z&ske=2026-08-16T21%3A21%3A54Z&sks=b&skv=2026-02-06&sig=S7c5xehANvCToPuVXgtxhU6XxikXyLmJEeQPUnVWExw%3D
+        run: |
+          set -euo pipefail
+          archive="$RUNNER_TEMP/aef150-v4.zip"
+          extracted="$RUNNER_TEMP/aef150-v4"
+          curl -fsSL --retry 2 --retry-delay 1 "$ARTIFACT_URL" -o "$archive"
+          mkdir -p "$extracted"
+          unzip -q "$archive" -d "$extracted"
+
+          yaml="$extracted/aef-worker-v4.yaml"
+          manifest="$extracted/aef-worker-v4-manifest.json"
+          test -f "$yaml"
+          test -f "$manifest"
+          test "$(wc -c < "$yaml" | tr -d ' ')" = "100695"
+          test "$(sha256sum "$yaml" | cut -d' ' -f1)" = "b8be3e80dfcd840a0aaf50d1b6d377dec857a77d0ce942718fcb2d9ba20a487c"
+          test "$(wc -c < "$manifest" | tr -d ' ')" = "1031"
+          test "$(sha256sum "$manifest" | cut -d' ' -f1)" = "b99ac0759f538897a2cabeb757b7b8dafe472f2e14d48113069e9a42cb0026da"
+
+          cp "$yaml" aef-worker-v4.yaml
+          cp "$manifest" aef-worker-v4-manifest.json
+
+          test "$(wc -c < aef-worker-v4.yaml | tr -d ' ')" = "100695"
+          test "$(sha256sum aef-worker-v4.yaml | cut -d' ' -f1)" = "b8be3e80dfcd840a0aaf50d1b6d377dec857a77d0ce942718fcb2d9ba20a487c"
+          test "$(wc -c < aef-worker-v4-manifest.json | tr -d ' ')" = "1031"
+          test "$(sha256sum aef-worker-v4-manifest.json | cut -d' ' -f1)" = "b99ac0759f538897a2cabeb757b7b8dafe472f2e14d48113069e9a42cb0026da"
+
+      - name: Commit exact bytes
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add aef-worker-v4.yaml aef-worker-v4-manifest.json
+          if git diff --cached --quiet; then
+            exit 0
+          fi
+          git commit -m "AEF-PUBLIC#5 publish exact bootstrap v4 bytes"
+          git push origin HEAD:publish/aef-150-clean-bootstrap-v4
