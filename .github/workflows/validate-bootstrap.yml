@@ -7,6 +7,8 @@ on:
     paths:
       - aef-worker-v3.yaml
       - aef-worker-v3-manifest.json
+      - aef-worker-v4.yaml
+      - aef-worker-v4-manifest.json
       - README.md
       - .github/workflows/validate-bootstrap.yml
   push:
@@ -15,6 +17,8 @@ on:
     paths:
       - aef-worker-v3.yaml
       - aef-worker-v3-manifest.json
+      - aef-worker-v4.yaml
+      - aef-worker-v4-manifest.json
       - README.md
       - .github/workflows/validate-bootstrap.yml
 
@@ -27,44 +31,16 @@ jobs:
     timeout-minutes: 5
     steps:
       - name: Checkout exact revision
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
 
-      - name: Verify public distribution contract
+      - name: Verify public distribution contracts
         run: |
           python3 - <<'PY'
           import hashlib
           import json
           from pathlib import Path
-
-          yaml_path = Path("aef-worker-v3.yaml")
-          manifest_path = Path("aef-worker-v3-manifest.json")
-          data = yaml_path.read_bytes()
-          manifest_bytes = manifest_path.read_bytes()
-          manifest = json.loads(manifest_bytes.decode("ascii"))
-
-          required = {
-              "schema_version": 3,
-              "profile_id": "digitalocean-remote-cloud-config-v3",
-              "bootstrap_version": 3,
-              "provider": "digitalocean",
-              "provider_image_slug": "ubuntu-24-04-x64",
-              "format": "remote-cloud-config",
-              "credential_values_present": False,
-              "activation_performed": False,
-          }
-          for key, value in required.items():
-              if manifest.get(key) != value:
-                  raise SystemExit(f"manifest contract mismatch: {key}")
-
-          actual_sha = hashlib.sha256(data).hexdigest()
-          if len(data) != manifest.get("remote_cloud_config_bytes"):
-              raise SystemExit("bootstrap byte-count mismatch")
-          if actual_sha != manifest.get("remote_cloud_config_sha256"):
-              raise SystemExit("bootstrap SHA-256 mismatch")
-          if not data.startswith(b"#cloud-config\n"):
-              raise SystemExit("bootstrap is not cloud-config")
 
           forbidden = (
               b"-----BEGIN OPENSSH PRIVATE KEY-----",
@@ -76,9 +52,81 @@ jobs:
               b"ghs_",
               b"ghr_",
           )
-          for marker in forbidden:
-              if marker in data or marker in manifest_bytes:
-                  raise SystemExit(f"forbidden credential marker: {marker!r}")
 
-          print(f"PUBLIC_BOOTSTRAP_PASS bytes={len(data)} sha256={actual_sha}")
+          def verify(version, required, expected):
+              yaml_path = Path(f"aef-worker-{version}.yaml")
+              manifest_path = Path(f"aef-worker-{version}-manifest.json")
+              data = yaml_path.read_bytes()
+              manifest_bytes = manifest_path.read_bytes()
+              manifest = json.loads(manifest_bytes.decode("ascii"))
+
+              for key, value in required.items():
+                  if manifest.get(key) != value:
+                      raise SystemExit(f"{version} manifest contract mismatch: {key}")
+
+              data_sha = hashlib.sha256(data).hexdigest()
+              manifest_sha = hashlib.sha256(manifest_bytes).hexdigest()
+              if len(data) != manifest.get("remote_cloud_config_bytes"):
+                  raise SystemExit(f"{version} bootstrap byte-count mismatch")
+              if data_sha != manifest.get("remote_cloud_config_sha256"):
+                  raise SystemExit(f"{version} bootstrap SHA-256 mismatch")
+              if len(data) != expected["yaml_bytes"] or data_sha != expected["yaml_sha256"]:
+                  raise SystemExit(f"{version} canonical bootstrap identity mismatch")
+              if len(manifest_bytes) != expected["manifest_bytes"] or manifest_sha != expected["manifest_sha256"]:
+                  raise SystemExit(f"{version} canonical manifest identity mismatch")
+              if not data.startswith(b"#cloud-config\n"):
+                  raise SystemExit(f"{version} bootstrap is not cloud-config")
+
+              for marker in forbidden:
+                  if marker in data or marker in manifest_bytes:
+                      raise SystemExit(f"{version} forbidden credential marker: {marker!r}")
+
+              print(
+                  f"PUBLIC_BOOTSTRAP_{version.upper()}_PASS "
+                  f"bytes={len(data)} sha256={data_sha} "
+                  f"manifest_bytes={len(manifest_bytes)} manifest_sha256={manifest_sha}"
+              )
+
+          verify(
+              "v3",
+              {
+                  "schema_version": 3,
+                  "profile_id": "digitalocean-remote-cloud-config-v3",
+                  "bootstrap_version": 3,
+                  "provider": "digitalocean",
+                  "provider_image_slug": "ubuntu-24-04-x64",
+                  "format": "remote-cloud-config",
+                  "credential_values_present": False,
+                  "activation_performed": False,
+              },
+              {
+                  "yaml_bytes": 81936,
+                  "yaml_sha256": "ac1ee32fb5fa1b50a2a4fc5858bb149410580ddd73a6b1a6ff5252a251d6e2a8",
+                  "manifest_bytes": 784,
+                  "manifest_sha256": "c27753fa5fdadafa43ddac749c23bea95fd00ee496c4fe3ed13888b87ecc6157",
+              },
+          )
+
+          verify(
+              "v4",
+              {
+                  "schema_version": 4,
+                  "profile_id": "digitalocean-remote-cloud-config-v4",
+                  "bootstrap_driver_version": 4,
+                  "runtime_core_version": 3,
+                  "root_mode_acceptance_required": True,
+                  "historical_failure_corpus_required": True,
+                  "provider": "digitalocean",
+                  "provider_image_slug": "ubuntu-24-04-x64",
+                  "format": "remote-cloud-config",
+                  "credential_values_present": False,
+                  "activation_performed": False,
+              },
+              {
+                  "yaml_bytes": 100695,
+                  "yaml_sha256": "b8be3e80dfcd840a0aaf50d1b6d377dec857a77d0ce942718fcb2d9ba20a487c",
+                  "manifest_bytes": 1031,
+                  "manifest_sha256": "b99ac0759f538897a2cabeb757b7b8dafe472f2e14d48113069e9a42cb0026da",
+              },
+          )
           PY
