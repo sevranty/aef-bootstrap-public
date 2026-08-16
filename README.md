@@ -9,9 +9,48 @@ Activation task:
 https://github.com/sevranty/agent-execution-fabric/issues/61
 
 Current publication task:
-https://github.com/sevranty/aef-bootstrap-public/issues/5
+https://github.com/sevranty/aef-bootstrap-public/issues/7
 
-## Current bootstrap v4
+## Current bootstrap v5
+
+Source task:
+https://github.com/sevranty/agent-execution-fabric/issues/167
+
+Source AEF merge:
+017c93e8d0317a8637ea0c41fdc0e7b8cf6636e3
+
+Source full validation run:
+31947983555
+
+Source clean-bootstrap v5 validation run:
+31947983513
+
+Source artifact:
+9263834307
+
+Source artifact digest:
+sha256:d5c0702baba5637bb84c9dd4bfaac167f74350c99497ab317101e128115ac716
+
+Published files:
+- aef-worker-v5.yaml: 125666 bytes, SHA-256 7ab08496444bca789a681519700e8ffe477282e99c69b1c1df172521f2ca6095
+- aef-worker-v5-manifest.json: 1429 bytes, SHA-256 8a91db7a84d9417821dc906b8a00e8c3411c6953d1234618203011729e455a40
+
+Bootstrap v5 preserves the accepted AEF worker release and adds a separately verified immutable GitHub CLI capability required by REP#191 admission:
+- AEF release remains `a1eee6efa50b367d7ef2ffade4833fbf2b670c9b6476a7173d0679de663a33ce`;
+- GitHub CLI is pinned to `2.97.0` for Linux amd64;
+- source asset is exactly 14770812 bytes with SHA-256 `a2c9b8497e1f85b1ad0dfcb78b5a622e098801b8e461e459e88e1ee12f018112`;
+- the archive is verified before extracting only the exact `bin/gh` member;
+- no package-manager install, mutable `latest` URL or credential value is used;
+- the capability is published atomically under `/opt/aef/capabilities/github-cli/2.97.0`;
+- bootstrap verifies `gh --version` without performing authentication;
+- root-mode Ubuntu 24.04 production-sequence acceptance remains mandatory;
+- v3/v4 historical regressions remain mandatory;
+- provider attempts remain forbidden until repository and public distribution gates pass.
+
+## Historical bootstrap v4
+
+Publication task:
+https://github.com/sevranty/aef-bootstrap-public/issues/5
 
 Source task:
 https://github.com/sevranty/agent-execution-fabric/issues/150
@@ -28,18 +67,11 @@ Source clean-bootstrap v4 root-mode validation run:
 Source artifact:
 9255179132
 
-Published files:
+Published files retained as historical evidence:
 - aef-worker-v4.yaml: 100695 bytes, SHA-256 b8be3e80dfcd840a0aaf50d1b6d377dec857a77d0ce942718fcb2d9ba20a487c
 - aef-worker-v4-manifest.json: 1031 bytes, SHA-256 b99ac0759f538897a2cabeb757b7b8dafe472f2e14d48113069e9a42cb0026da
 
-Bootstrap v4 adds the clean-host acceptance controls required after the third live acceptance failure:
-- root-mode Ubuntu 24.04 / Python 3.12 parity is a required repository gate;
-- runtime import smoke is bytecode-free and proves that the immutable release tree is not changed;
-- all three historical live clean-deploy failures are regression-covered;
-- worker-local read-only status is available in both human-readable and deterministic JSON forms;
-- bootstrap records stable phases, passed checks, failure code/detail, safe next action and a secret-free event log;
-- a new live provider attempt is forbidden until repository and public immutable-distribution gates both pass;
-- failed clean hosts are evidence and are not repaired into acceptance.
+Bootstrap v4 established root-mode clean-host acceptance, bytecode-free runtime smoke, deterministic status evidence and the rule that failed clean hosts are not repaired into acceptance.
 
 ## Historical bootstrap v3
 
@@ -62,10 +94,7 @@ Published files retained as historical evidence:
 - aef-worker-v3.yaml: 81936 bytes, SHA-256 ac1ee32fb5fa1b50a2a4fc5858bb149410580ddd73a6b1a6ff5252a251d6e2a8
 - aef-worker-v3-manifest.json: 784 bytes, SHA-256 c27753fa5fdadafa43ddac749c23bea95fd00ee496c4fe3ed13888b87ecc6157
 
-Bootstrap v3 incorporated AEF#126 provider parity:
-- canonical Ubuntu 24.04 `/etc/os-release -> ../usr/lib/os-release` is accepted only when it resolves to the exact canonical target;
-- arbitrary symlink targets fail closed;
-- DigitalOcean provider `#include` payloads are generated without a terminal newline so owner input and provider metadata have the same byte identity.
+Bootstrap v3 incorporated canonical Ubuntu 24.04 provider parity and exact no-terminal-newline DigitalOcean `#include` payloads.
 
 ## Security boundary
 
@@ -74,6 +103,7 @@ Bootstrap v3 incorporated AEF#126 provider parity:
 - no private AEF source-tree mirror
 - immutable commit URLs are required for DigitalOcean bootstrap
 - mutable branch URLs must not be used for worker creation
-- public validation pins both historical v3 and current v4 byte count and SHA-256
+- public validation pins v3, v4 and current v5 byte counts and SHA-256 identities
+- public validation also pins the v5 GitHub CLI asset identity and capability contract
 
 DigitalOcean must use only the exact immutable raw URL produced after the publication Pull Request is merged. Do not use a URL containing `main` or another mutable branch name.
