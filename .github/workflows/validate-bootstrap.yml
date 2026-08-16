@@ -9,6 +9,8 @@ on:
       - aef-worker-v3-manifest.json
       - aef-worker-v4.yaml
       - aef-worker-v4-manifest.json
+      - aef-worker-v5.yaml
+      - aef-worker-v5-manifest.json
       - README.md
       - .github/workflows/validate-bootstrap.yml
   push:
@@ -19,6 +21,8 @@ on:
       - aef-worker-v3-manifest.json
       - aef-worker-v4.yaml
       - aef-worker-v4-manifest.json
+      - aef-worker-v5.yaml
+      - aef-worker-v5-manifest.json
       - README.md
       - .github/workflows/validate-bootstrap.yml
 
@@ -127,6 +131,35 @@ jobs:
                   "yaml_sha256": "b8be3e80dfcd840a0aaf50d1b6d377dec857a77d0ce942718fcb2d9ba20a487c",
                   "manifest_bytes": 1031,
                   "manifest_sha256": "b99ac0759f538897a2cabeb757b7b8dafe472f2e14d48113069e9a42cb0026da",
+              },
+          )
+
+          verify(
+              "v5",
+              {
+                  "schema_version": 5,
+                  "profile_id": "digitalocean-remote-cloud-config-v5",
+                  "bootstrap_driver_version": 5,
+                  "runtime_core_version": 3,
+                  "root_mode_acceptance_required": True,
+                  "historical_failure_corpus_required": True,
+                  "provider": "digitalocean",
+                  "provider_image_slug": "ubuntu-24-04-x64",
+                  "format": "remote-cloud-config",
+                  "release_archive_sha256": "a1eee6efa50b367d7ef2ffade4833fbf2b670c9b6476a7173d0679de663a33ce",
+                  "github_cli_version": "2.97.0",
+                  "github_cli_asset_bytes": 14770812,
+                  "github_cli_asset_sha256": "a2c9b8497e1f85b1ad0dfcb78b5a622e098801b8e461e459e88e1ee12f018112",
+                  "capabilities_required": ["github-api"],
+                  "network_required_during_bootstrap": True,
+                  "credential_values_present": False,
+                  "activation_performed": False,
+              },
+              {
+                  "yaml_bytes": 125666,
+                  "yaml_sha256": "7ab08496444bca789a681519700e8ffe477282e99c69b1c1df172521f2ca6095",
+                  "manifest_bytes": 1429,
+                  "manifest_sha256": "8a91db7a84d9417821dc906b8a00e8c3411c6953d1234618203011729e455a40",
               },
           )
           PY
