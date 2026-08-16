@@ -1,0 +1,1108 @@
+#cloud-config
+package_update: false
+package_upgrade: false
+write_files:
+- path: /usr/local/sbin/aef-bootstrap-v3.py
+  permissions: '0555'
+  owner: root:root
+  content: |
+    #!/usr/bin/env python3
+    """AEF v3 clean-host bootstrap runtime for Ubuntu 24.04."""
+    from __future__ import annotations
+    
+    import base64
+    import hashlib
+    import io
+    import json
+    import os
+    from pathlib import Path, PurePosixPath
+    import pwd
+    import shutil
+    import stat
+    import subprocess
+    import sys
+    import tarfile
+    
+    BOOTSTRAP_VERSION = 3
+    ROOT = Path("/")
+    MANIFEST_PATH = "/etc/aef/bootstrap-manifest-v3.json"
+    PAYLOAD_PATH = "/opt/aef-release-v3.b85"
+    STATE_PATH = "/etc/aef/bootstrap-state.json"
+    RELEASES_PATH = "/opt/aef/releases"
+    CURRENT_PATH = "/opt/aef/current"
+    SWAP_PATH = "/swapfile"
+    SWAP_BYTES = 1024 * 1024 * 1024
+    DISK_HEADROOM_BYTES = 512 * 1024 * 1024
+    TOP_LEVEL = "aef-release"
+    MAX_ARCHIVE_BYTES = 64 * 1024 * 1024
+    MANIFEST_KEYS = {
+        "schema_version", "bootstrap_version", "release_sha256", "release_bytes",
+        "inventory_sha256", "file_count", "files",
+    }
+    FILE_KEYS = {"path", "bytes", "mode", "sha256"}
+    phase = "INIT"
+    
+    
+    class BootstrapBlocked(RuntimeError):
+        pass
+    
+    
+    def rp(value: str) -> Path:
+        if not value.startswith("/"):
+            raise BootstrapBlocked("ABSOLUTE_PATH_REQUIRED")
+        return ROOT / value.lstrip("/")
+    
+    
+    def fail(code: str, detail: str = "") -> None:
+        raise BootstrapBlocked(code + (":" + str(detail)[:240] if detail else ""))
+    
+    
+    def _json_bytes(value) -> bytes:
+        return (json.dumps(value, ensure_ascii=True, sort_keys=True, separators=(",", ":")) + "\n").encode("ascii")
+    
+    
+    def atomic_json(path: Path, value) -> None:
+        if path.parent.is_symlink():
+            fail("STATE_PARENT_SYMLINK")
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_name(path.name + ".tmp")
+        if tmp.exists() or tmp.is_symlink():
+            tmp.unlink()
+        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
+        fd = os.open(tmp, flags, 0o444)
+        try:
+            data = _json_bytes(value)
+            os.write(fd, data)
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+        os.replace(tmp, path)
+    
+    
+    def run_exact(candidates, *args, timeout=30, capture=False) -> str:
+        executable = None
+        for raw in candidates:
+            path = Path(raw)
+            try:
+                resolved = path.resolve(strict=True)
+            except OSError:
+                continue
+            if resolved.is_file() and os.access(resolved, os.X_OK):
+                executable = str(resolved)
+                break
+        if executable is None:
+            fail("BASE_EXECUTABLE_MISSING", "|".join(candidates))
+        result = subprocess.run(
+            [executable, *args],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE if capture else subprocess.DEVNULL,
+            stderr=subprocess.STDOUT if capture else subprocess.DEVNULL,
+            text=True,
+            timeout=timeout,
+            check=False,
+            env={"PATH": "/usr/bin:/bin:/usr/sbin:/sbin", "HOME": "/root"},
+        )
+        if result.returncode != 0:
+            fail("BASE_COMMAND_FAILED", Path(executable).name)
+        return result.stdout if capture else ""
+    
+    
+    def systemd_version() -> str:
+        output = run_exact(("/usr/bin/systemctl", "/bin/systemctl"), "--version", timeout=5, capture=True)
+        return output.splitlines()[0] if output.splitlines() else "unknown"
+    
+    
+    def swap_active() -> bool:
+        try:
+            rows = rp("/proc/swaps").read_text(encoding="utf-8").splitlines()[1:]
+        except OSError:
+            return False
+        return any(row.split() and row.split()[0] == SWAP_PATH for row in rows)
+    
+    
+    def service_installed() -> bool:
+        return any(
+            path.exists() or path.is_symlink()
+            for path in (
+                rp("/etc/systemd/system/aef-worker.service"),
+                rp("/usr/lib/systemd/system/aef-worker.service"),
+                rp("/lib/systemd/system/aef-worker.service"),
+            )
+        )
+    
+    
+    def state(status: str, manifest=None, error=None, detail=None) -> None:
+        atomic_json(
+            rp(STATE_PATH),
+            {
+                "schema_version": 1,
+                "bootstrap_version": BOOTSTRAP_VERSION,
+                "status": status,
+                "phase": phase,
+                "release_sha256": manifest.get("release_sha256") if isinstance(manifest, dict) else None,
+                "swap_bytes": SWAP_BYTES,
+                "swap_active": swap_active(),
+                "python": sys.version.split()[0],
+                "systemd": systemd_version(),
+                "service_installed": service_installed(),
+                "service_enabled": False,
+                "worker_enrolled": False,
+                "dispatch_enabled": False,
+                "failure_class": error,
+                "failure_detail": detail,
+            },
+        )
+    
+    
+    def mark(name: str, manifest=None) -> None:
+        global phase
+        phase = name
+        state("RUNNING", manifest)
+    
+    
+    def _os_release_path() -> Path:
+        etc_path = rp("/etc/os-release")
+        usr_path = rp("/usr/lib/os-release")
+        try:
+            etc_observed = os.lstat(etc_path)
+        except OSError:
+            fail("OS_RELEASE_INVALID")
+        if stat.S_ISLNK(etc_observed.st_mode):
+            try:
+                resolved = etc_path.resolve(strict=True)
+                expected = usr_path.resolve(strict=True)
+            except OSError:
+                fail("OS_RELEASE_INVALID")
+            if resolved != expected:
+                fail("OS_RELEASE_SYMLINK_TARGET_INVALID", str(resolved))
+            path = expected
+        elif stat.S_ISREG(etc_observed.st_mode):
+            path = etc_path
+        else:
+            fail("OS_RELEASE_INVALID")
+        try:
+            observed = os.lstat(path)
+        except OSError:
+            fail("OS_RELEASE_INVALID")
+        if not stat.S_ISREG(observed.st_mode) or stat.S_ISLNK(observed.st_mode):
+            fail("OS_RELEASE_TARGET_INVALID")
+        if stat.S_IMODE(observed.st_mode) & 0o022:
+            fail("OS_RELEASE_TARGET_WRITABLE")
+        return path
+    
+    
+    def verify_os() -> None:
+        path = _os_release_path()
+        values = {}
+        for line in path.read_text(encoding="utf-8").splitlines():
+            if "=" in line:
+                key, value = line.split("=", 1)
+                values[key] = value.strip().strip('"')
+        if values.get("ID") != "ubuntu" or values.get("VERSION_ID") != "24.04":
+            fail("OS_CONTRACT_MISMATCH", values.get("PRETTY_NAME", "unknown"))
+        if sys.version_info[:2] != (3, 12):
+            fail("PYTHON_CONTRACT_MISMATCH", sys.version.split()[0])
+    
+    
+    def load_manifest() -> dict:
+        path = rp(MANIFEST_PATH)
+        if path.is_symlink() or not path.is_file():
+            fail("MANIFEST_INVALID")
+        try:
+            value = json.loads(path.read_text(encoding="ascii"))
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+            fail("MANIFEST_UNREADABLE")
+        if not isinstance(value, dict) or set(value) != MANIFEST_KEYS:
+            fail("MANIFEST_FIELDS_INVALID")
+        if value.get("schema_version") != 1 or value.get("bootstrap_version") != BOOTSTRAP_VERSION:
+            fail("MANIFEST_IDENTITY_INVALID")
+        files = value.get("files")
+        if not isinstance(files, list) or value.get("file_count") != len(files) or not files:
+            fail("MANIFEST_FILESET_INVALID")
+        seen = set()
+        for record in files:
+            if not isinstance(record, dict) or set(record) != FILE_KEYS:
+                fail("MANIFEST_FILE_INVALID")
+            path_text = record.get("path")
+            digest = record.get("sha256")
+            pure = PurePosixPath(path_text) if isinstance(path_text, str) else None
+            if (
+                pure is None
+                or not path_text
+                or path_text in seen
+                or pure.is_absolute()
+                or "." in pure.parts
+                or ".." in pure.parts
+                or record.get("mode") not in {"0444", "0555"}
+                or not isinstance(record.get("bytes"), int)
+                or isinstance(record.get("bytes"), bool)
+                or record["bytes"] < 1
+                or not isinstance(digest, str)
+                or len(digest) != 64
+                or any(ch not in "0123456789abcdef" for ch in digest)
+            ):
+                fail("MANIFEST_FILE_INVALID", str(path_text))
+            seen.add(path_text)
+        for key in ("release_sha256", "inventory_sha256"):
+            digest = value.get(key)
+            if not isinstance(digest, str) or len(digest) != 64 or any(ch not in "0123456789abcdef" for ch in digest):
+                fail("MANIFEST_DIGEST_INVALID", key)
+        if not isinstance(value.get("release_bytes"), int) or not 0 < value["release_bytes"] <= MAX_ARCHIVE_BYTES:
+            fail("MANIFEST_RELEASE_BYTES_INVALID")
+        expected = sorted(files, key=lambda item: item["path"])
+        if hashlib.sha256(_json_bytes(expected)).hexdigest() != value["inventory_sha256"]:
+            fail("MANIFEST_INVENTORY_INVALID")
+        return value
+    
+    
+    def ensure_user_and_dirs() -> None:
+        try:
+            account = pwd.getpwnam("aef")
+        except KeyError:
+            run_exact(
+                ("/usr/sbin/useradd", "/sbin/useradd"),
+                "--system", "--no-create-home", "--home-dir", "/nonexistent",
+                "--shell", "/usr/sbin/nologin", "aef",
+            )
+            try:
+                account = pwd.getpwnam("aef")
+            except KeyError:
+                fail("AEF_USER_CREATE_FAILED")
+        if account.pw_shell not in {"/usr/sbin/nologin", "/sbin/nologin"}:
+            fail("AEF_USER_SHELL_DRIFT")
+        for raw, mode, owned in (
+            ("/opt/aef", 0o755, False),
+            (RELEASES_PATH, 0o755, False),
+            ("/var/lib/aef", 0o700, True),
+            ("/var/lib/aef/staging", 0o700, True),
+            ("/var/lib/aef/state", 0o700, True),
+            ("/etc/aef", 0o755, False),
+        ):
+            path = rp(raw)
+            if path.is_symlink():
+                fail("BOOTSTRAP_PATH_SYMLINK", raw)
+            path.mkdir(parents=True, exist_ok=True)
+            os.chmod(path, mode)
+            if owned:
+                os.chown(path, account.pw_uid, account.pw_gid)
+    
+    
+    def ensure_swap() -> None:
+        path = rp(SWAP_PATH)
+        if path.exists() or path.is_symlink():
+            if path.is_symlink() or not path.is_file():
+                fail("SWAPFILE_INVALID")
+        else:
+            if shutil.disk_usage(rp("/")).free < SWAP_BYTES + DISK_HEADROOM_BYTES:
+                fail("DISK_HEADROOM_INSUFFICIENT")
+            run_exact(("/usr/bin/fallocate", "/bin/fallocate"), "-l", str(SWAP_BYTES), str(path), timeout=60)
+            os.chmod(path, 0o600)
+            run_exact(("/usr/sbin/mkswap", "/sbin/mkswap"), str(path), timeout=30)
+            run_exact(("/usr/sbin/swapon", "/sbin/swapon"), str(path), timeout=30)
+        observed = os.lstat(path)
+        if (
+            not stat.S_ISREG(observed.st_mode)
+            or observed.st_size != SWAP_BYTES
+            or observed.st_uid != 0
+            or stat.S_IMODE(observed.st_mode) != 0o600
+        ):
+            fail("SWAPFILE_DRIFT")
+        if not swap_active():
+            fail("SWAP_NOT_ACTIVE")
+        fstab = rp("/etc/fstab")
+        if fstab.is_symlink() or not fstab.is_file():
+            fail("FSTAB_INVALID")
+        rows = [
+            line.split()
+            for line in fstab.read_text(encoding="utf-8").splitlines()
+            if line.strip() and not line.lstrip().startswith("#")
+        ]
+        swap_rows = [row for row in rows if row and row[0] == SWAP_PATH]
+        if not swap_rows:
+            with fstab.open("a", encoding="utf-8") as handle:
+                handle.write("/swapfile none swap sw 0 0\n")
+                handle.flush()
+                os.fsync(handle.fileno())
+        elif len(swap_rows) != 1 or len(swap_rows[0]) < 3 or swap_rows[0][2] != "swap":
+            fail("FSTAB_SWAP_DRIFT")
+    
+    
+    def read_archive(manifest: dict) -> bytes:
+        path = rp(PAYLOAD_PATH)
+        if path.is_symlink() or not path.is_file() or os.lstat(path).st_mode & 0o222:
+            fail("PAYLOAD_FILE_INVALID")
+        try:
+            data = base64.b85decode(path.read_text(encoding="ascii").strip().encode("ascii"))
+        except Exception:
+            fail("PAYLOAD_DECODE_FAILED")
+        if len(data) != manifest["release_bytes"] or hashlib.sha256(data).hexdigest() != manifest["release_sha256"]:
+            fail("ARCHIVE_SHA_MISMATCH")
+        return data
+    
+    
+    def expected_dirs(files) -> set[str]:
+        result = set()
+        for record in files:
+            parts = PurePosixPath(record["path"]).parts[:-1]
+            current = []
+            for part in parts:
+                current.append(part)
+                result.add("/".join(current))
+        return result
+    
+    
+    def validate_members(bundle: tarfile.TarFile, manifest: dict) -> None:
+        expected = {record["path"]: record for record in manifest["files"]}
+        directories = {TOP_LEVEL} | {TOP_LEVEL + "/" + value for value in expected_dirs(manifest["files"])}
+        seen = set()
+        seen_files = set()
+        seen_dirs = set()
+        total = 0
+        for member in bundle.getmembers():
+            raw = PurePosixPath(member.name)
+            key = raw.as_posix().rstrip("/")
+            if (
+                raw.is_absolute()
+                or "." in raw.parts
+                or ".." in raw.parts
+                or not raw.parts
+                or raw.parts[0] != TOP_LEVEL
+                or any(ord(ch) < 32 for ch in member.name)
+            ):
+                fail("ARCHIVE_PATH_INVALID", member.name)
+            if key in seen:
+                fail("ARCHIVE_DUPLICATE", key)
+            seen.add(key)
+            if member.isdir():
+                if key not in directories or stat.S_IMODE(member.mode) != 0o555:
+                    fail("ARCHIVE_DIRECTORY_INVALID", key)
+                seen_dirs.add(key)
+                continue
+            if not member.isfile():
+                fail("ARCHIVE_MEMBER_INVALID", key)
+            rel = PurePosixPath(*raw.parts[1:]).as_posix()
+            record = expected.get(rel)
+            if (
+                record is None
+                or member.size != record["bytes"]
+                or format(stat.S_IMODE(member.mode), "04o") != record["mode"]
+            ):
+                fail("ARCHIVE_FILE_METADATA_DRIFT", rel)
+            total += member.size
+            if total > MAX_ARCHIVE_BYTES:
+                fail("ARCHIVE_SIZE_INVALID")
+            seen_files.add(rel)
+        if seen_files != set(expected) or seen_dirs != directories:
+            fail("ARCHIVE_FILESET_MISMATCH")
+    
+    
+    def _directory_set(root: Path) -> set[str]:
+        result = set()
+        for path in root.rglob("*"):
+            observed = os.lstat(path)
+            if stat.S_ISDIR(observed.st_mode):
+                result.add(path.relative_to(root).as_posix())
+        return result
+    
+    
+    def inventory(root: Path, manifest: dict, *, require_frozen_root: bool = True) -> list[dict]:
+        root_observed = os.lstat(root)
+        if not stat.S_ISDIR(root_observed.st_mode) or root.is_symlink():
+            fail("TREE_ROOT_INVALID")
+        if require_frozen_root and stat.S_IMODE(root_observed.st_mode) != 0o555:
+            fail("TREE_ROOT_MODE_DRIFT")
+        records = []
+        dirs = set()
+        for path in root.rglob("*"):
+            rel = path.relative_to(root).as_posix()
+            observed = os.lstat(path)
+            if stat.S_ISLNK(observed.st_mode):
+                fail("TREE_SYMLINK", rel)
+            if stat.S_ISDIR(observed.st_mode):
+                dirs.add(rel)
+                if stat.S_IMODE(observed.st_mode) != 0o555:
+                    fail("TREE_DIR_MODE_DRIFT", rel)
+                continue
+            if not stat.S_ISREG(observed.st_mode):
+                fail("TREE_NODE_INVALID", rel)
+            if rel == ".aef-release-sha256":
+                continue
+            data = path.read_bytes()
+            records.append(
+                {
+                    "path": rel,
+                    "bytes": len(data),
+                    "mode": format(stat.S_IMODE(observed.st_mode), "04o"),
+                    "sha256": hashlib.sha256(data).hexdigest(),
+                }
+            )
+        records = sorted(records, key=lambda item: item["path"])
+        if records != sorted(manifest["files"], key=lambda item: item["path"]):
+            fail("TREE_RECORDS_MISMATCH")
+        if dirs != expected_dirs(manifest["files"]):
+            fail("TREE_DIRSET_MISMATCH")
+        if hashlib.sha256(_json_bytes(records)).hexdigest() != manifest["inventory_sha256"]:
+            fail("TREE_DIGEST_MISMATCH")
+        return records
+    
+    
+    def extract_release(data: bytes, stage: Path, manifest: dict) -> Path:
+        if stage.exists() or stage.is_symlink():
+            fail("STAGE_EXISTS")
+        stage.mkdir(mode=0o755)
+        with tarfile.open(fileobj=io.BytesIO(data), mode="r:gz") as bundle:
+            validate_members(bundle, manifest)
+            bundle.extractall(stage, filter="data")
+        root = stage / TOP_LEVEL
+        if root.is_symlink() or not root.is_dir():
+            fail("EXTRACT_ROOT_INVALID")
+        for record in manifest["files"]:
+            path = root.joinpath(*PurePosixPath(record["path"]).parts)
+            if path.is_symlink() or not path.is_file():
+                fail("EXTRACTED_FILE_INVALID", record["path"])
+            content = path.read_bytes()
+            if len(content) != record["bytes"] or hashlib.sha256(content).hexdigest() != record["sha256"]:
+                fail("EXTRACTED_FILE_CONTENT_DRIFT", record["path"])
+            os.chmod(path, int(record["mode"], 8))
+        marker = root / ".aef-release-sha256"
+        marker.write_text(manifest["release_sha256"] + "\n", encoding="ascii")
+        os.chmod(marker, 0o444)
+        derived_dirs = expected_dirs(manifest["files"])
+        if _directory_set(root) != derived_dirs:
+            fail("TREE_DIRSET_MISMATCH")
+        for rel in sorted(derived_dirs, key=lambda value: len(PurePosixPath(value).parts), reverse=True):
+            path = root.joinpath(*PurePosixPath(rel).parts)
+            if path.is_symlink() or not path.is_dir():
+                fail("EXTRACTED_DIR_INVALID", rel)
+            os.chmod(path, 0o555)
+        # Keep only the unpublished staging root root-writable until the atomic rename.
+        # All release files and child directories are already immutable and verified.
+        os.chmod(root, 0o755)
+        inventory(root, manifest, require_frozen_root=False)
+        return root
+    
+    
+    def verify_tree(root: Path, manifest: dict) -> None:
+        if root.is_symlink() or not root.is_dir():
+            fail("TARGET_INVALID")
+        if stat.S_IMODE(os.lstat(root).st_mode) != 0o555:
+            fail("TARGET_ROOT_MODE_DRIFT")
+        marker = root / ".aef-release-sha256"
+        if (
+            marker.is_symlink()
+            or not marker.is_file()
+            or marker.read_text(encoding="ascii").strip() != manifest["release_sha256"]
+        ):
+            fail("MARKER_DRIFT")
+        inventory(root, manifest)
+    
+    
+    def _verified_publish_parent(path: Path, code: str) -> None:
+        if path.is_symlink() or not path.is_dir():
+            fail(code + "_INVALID")
+        if stat.S_IMODE(os.lstat(path).st_mode) != 0o755:
+            fail(code + "_MODE_DRIFT")
+    
+    
+    def install_release(data: bytes, manifest: dict) -> Path:
+        releases = rp(RELEASES_PATH)
+        target = releases / manifest["release_sha256"]
+        stage = releases / (".stage-" + manifest["release_sha256"])
+        _verified_publish_parent(releases, "RELEASES")
+        if target.is_symlink():
+            fail("TARGET_SYMLINK")
+        if target.exists():
+            verify_tree(target, manifest)
+            return target
+        if stage.is_symlink():
+            fail("STAGE_SYMLINK")
+        if stage.exists():
+            if not stage.is_dir():
+                fail("STAGE_INVALID")
+            shutil.rmtree(stage)
+        root = extract_release(data, stage, manifest)
+        _verified_publish_parent(stage, "STAGE")
+        if stat.S_IMODE(os.lstat(root).st_mode) != 0o755:
+            fail("STAGE_ROOT_MODE_DRIFT")
+        os.rename(root, target)
+        os.chmod(target, 0o555)
+        shutil.rmtree(stage)
+        verify_tree(target, manifest)
+        return target
+    
+    
+    def runtime_smoke(target: Path) -> None:
+        modules = [
+            "runtime." + path.stem
+            for path in sorted((target / "runtime").glob("*.py"))
+            if path.name != "__init__.py"
+        ]
+        code = (
+            "import importlib,sys;sys.path.insert(0,"
+            + repr(str(target))
+            + ");mods="
+            + repr(modules)
+            + ";[importlib.import_module(name) for name in mods]"
+        )
+        result = subprocess.run(
+            ["/usr/bin/python3", "-I", "-c", code],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=120,
+            check=False,
+            env={"PATH": "/usr/bin:/bin:/usr/sbin:/sbin", "HOME": "/root"},
+        )
+        if result.returncode != 0:
+            fail("RUNTIME_SMOKE_FAILED", result.stderr.splitlines()[-1] if result.stderr else "")
+    
+    
+    def publish_current(target: Path, manifest: dict) -> None:
+        current = rp(CURRENT_PATH)
+        if current.is_symlink():
+            if current.resolve(strict=True) != target.resolve(strict=True):
+                fail("CURRENT_DRIFT")
+            return
+        if current.exists():
+            fail("CURRENT_NOT_SYMLINK")
+        tmp = current.with_name(".current-" + manifest["release_sha256"])
+        if tmp.exists() or tmp.is_symlink():
+            tmp.unlink()
+        os.symlink(str(target), tmp)
+        os.replace(tmp, current)
+    
+    
+    def main() -> int:
+        manifest = None
+        try:
+            if os.geteuid() != 0:
+                fail("ROOT_REQUIRED")
+            mark("PRECHECK")
+            verify_os()
+            manifest = load_manifest()
+            ensure_user_and_dirs()
+            mark("SWAP", manifest)
+            ensure_swap()
+            mark("VERIFY_ARCHIVE", manifest)
+            data = read_archive(manifest)
+            mark("INSTALL_RELEASE", manifest)
+            target = install_release(data, manifest)
+            mark("RUNTIME_SMOKE", manifest)
+            runtime_smoke(target)
+            mark("PUBLISH_CURRENT", manifest)
+            publish_current(target, manifest)
+            verify_tree(target, manifest)
+            if service_installed():
+                fail("SERVICE_PREMATURELY_INSTALLED")
+            global phase
+            phase = "READY"
+            state("BOOTSTRAP_READY_NOT_ENROLLED", manifest)
+            return 0
+        except Exception as exc:
+            try:
+                state("BLOCKED", manifest, type(exc).__name__, str(exc)[:240])
+            except Exception:
+                pass
+            raise
+    
+    
+    if __name__ == "__main__":
+        raise SystemExit(main())
+- path: /usr/local/sbin/aef-bootstrap-v4.py
+  permissions: '0555'
+  owner: root:root
+  content: |
+    #!/usr/bin/env python3
+    """AEF v4 clean-bootstrap driver.
+    
+    The v3 core remains immutable historical implementation evidence. This driver patches
+    only the live execution seams required for root-safe smoke validation and adds
+    read-only, secret-free diagnostics.
+    """
+    from __future__ import annotations
+    
+    import argparse
+    import hashlib
+    import importlib.util
+    import json
+    import os
+    from pathlib import Path
+    import stat
+    import subprocess
+    import sys
+    import urllib.request
+    
+    DRIVER_VERSION = 4
+    CORE_VERSION = 3
+    CORE_PATH = Path("/usr/local/sbin/aef-bootstrap-v3.py")
+    STATE_PATH = "/etc/aef/bootstrap-state.json"
+    SUMMARY_PATH = "/etc/aef/bootstrap-summary.txt"
+    EVENT_LOG_PATH = "/var/log/aef/bootstrap-v4-events.jsonl"
+    CURRENT_PATH = "/opt/aef/current"
+    SWAP_PATH = "/swapfile"
+    PHASES = (
+        "PRECHECK",
+        "SWAP",
+        "VERIFY_ARCHIVE",
+        "INSTALL_RELEASE",
+        "RUNTIME_SMOKE",
+        "PUBLISH_CURRENT",
+        "READY",
+    )
+    CHECKS: list[dict] = []
+    
+    
+    def canonical_json_bytes(value) -> bytes:
+        return (
+            json.dumps(value, ensure_ascii=True, sort_keys=True, separators=(",", ":"))
+            + "\n"
+        ).encode("ascii")
+    
+    
+    def load_core(path: Path = CORE_PATH):
+        spec = importlib.util.spec_from_file_location("aef_bootstrap_core_v3", path)
+        if spec is None or spec.loader is None:
+            raise RuntimeError("BOOTSTRAP_CORE_LOAD_FAILED")
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        return module
+    
+    
+    def record_check(name: str, detail: str = "") -> None:
+        for item in CHECKS:
+            if item["name"] == name:
+                item["status"] = "PASS"
+                item["detail"] = detail
+                return
+        CHECKS.append({"name": name, "status": "PASS", "detail": detail})
+    
+    
+    def tree_fingerprint(root: Path) -> list[dict]:
+        result = []
+        if not root.exists() or root.is_symlink():
+            return result
+        for path in sorted(root.rglob("*"), key=lambda value: value.as_posix()):
+            observed = os.lstat(path)
+            rel = path.relative_to(root).as_posix()
+            if stat.S_ISDIR(observed.st_mode):
+                result.append(
+                    {
+                        "path": rel,
+                        "type": "dir",
+                        "mode": format(stat.S_IMODE(observed.st_mode), "04o"),
+                    }
+                )
+            elif stat.S_ISREG(observed.st_mode):
+                data = path.read_bytes()
+                result.append(
+                    {
+                        "path": rel,
+                        "type": "file",
+                        "mode": format(stat.S_IMODE(observed.st_mode), "04o"),
+                        "bytes": len(data),
+                        "sha256": hashlib.sha256(data).hexdigest(),
+                    }
+                )
+            elif stat.S_ISLNK(observed.st_mode):
+                result.append(
+                    {
+                        "path": rel,
+                        "type": "symlink",
+                        "target": os.readlink(path),
+                    }
+                )
+            else:
+                result.append({"path": rel, "type": "other"})
+        return result
+    
+    
+    def _first_fingerprint_difference(before: list[dict], after: list[dict]) -> str:
+        left = {item["path"]: item for item in before}
+        right = {item["path"]: item for item in after}
+        for path in sorted(set(left) | set(right)):
+            if left.get(path) != right.get(path):
+                if path not in left:
+                    return "created=" + path
+                if path not in right:
+                    return "removed=" + path
+                return "changed=" + path
+        return "unknown"
+    
+    
+    def root_safe_runtime_smoke(core, target: Path) -> None:
+        before = tree_fingerprint(target)
+        modules = [
+            "runtime." + path.stem
+            for path in sorted((target / "runtime").glob("*.py"))
+            if path.name != "__init__.py"
+        ]
+        code = (
+            "import importlib,sys;sys.path.insert(0,"
+            + repr(str(target))
+            + ");mods="
+            + repr(modules)
+            + ";[importlib.import_module(name) for name in mods]"
+        )
+        result = subprocess.run(
+            ["/usr/bin/python3", "-B", "-I", "-c", code],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=120,
+            check=False,
+            env={
+                "PATH": "/usr/bin:/bin:/usr/sbin:/sbin",
+                "HOME": "/root",
+                "PYTHONDONTWRITEBYTECODE": "1",
+            },
+        )
+        if result.returncode != 0:
+            core.fail(
+                "RUNTIME_SMOKE_FAILED",
+                result.stderr.splitlines()[-1] if result.stderr else "",
+            )
+        after = tree_fingerprint(target)
+        if before != after:
+            core.fail(
+                "RUNTIME_SMOKE_MUTATED_RELEASE",
+                _first_fingerprint_difference(before, after),
+            )
+        record_check("runtime_smoke_no_mutation")
+    
+    
+    def _parse_failure(error, detail):
+        error_text = str(error or "UNKNOWN_FAILURE")
+        detail_text = str(detail or "")
+        if error_text == "BootstrapBlocked" and detail_text:
+            code, separator, remainder = detail_text.partition(":")
+            return code, remainder if separator else ""
+        return error_text, detail_text
+    
+    
+    def _next_action(status: str) -> str:
+        if status == "BOOTSTRAP_READY_NOT_ENROLLED":
+            return "DOCTOR_AND_ADMISSION"
+        if status == "BLOCKED":
+            return "REPOSITORY_FIX_REQUIRED_NEW_CLEAN_HOST_AFTER_PASS"
+        return "WAIT_FOR_BOOTSTRAP"
+    
+    
+    def _phase_position(name: str) -> tuple[int, int]:
+        try:
+            return PHASES.index(name) + 1, len(PHASES)
+        except ValueError:
+            return 0, len(PHASES)
+    
+    
+    def _append_event(core, value: dict) -> bool:
+        try:
+            path = core.rp(EVENT_LOG_PATH)
+            if path.is_symlink():
+                return False
+            path.parent.mkdir(parents=True, exist_ok=True)
+            event = {
+                "driver_version": DRIVER_VERSION,
+                "status": value["status"],
+                "phase": value["phase"],
+                "phase_index": value["phase_index"],
+                "phase_total": value["phase_total"],
+                "failure_code": value["failure_code"],
+                "checks": [item["name"] for item in value["checks"]],
+            }
+            with path.open("ab") as handle:
+                handle.write(canonical_json_bytes(event))
+                handle.flush()
+                os.fsync(handle.fileno())
+            return True
+        except Exception:
+            return False
+    
+    
+    def enhanced_state(core, status: str, manifest=None, error=None, detail=None) -> None:
+        failure_code, failure_detail = _parse_failure(error, detail)
+        if status != "BLOCKED":
+            failure_code = None
+            failure_detail = None
+        phase_index, phase_total = _phase_position(core.phase)
+        if status == "BOOTSTRAP_READY_NOT_ENROLLED":
+            record_check(
+                "release_identity",
+                manifest.get("release_sha256", "") if isinstance(manifest, dict) else "",
+            )
+            record_check("swap_active", str(core.swap_active()).lower())
+            record_check("service_absent", str(not core.service_installed()).lower())
+            record_check("worker_not_enrolled")
+            record_check("dispatch_disabled")
+        value = {
+            "schema_version": 2,
+            "bootstrap_version": DRIVER_VERSION,
+            "runtime_core_version": CORE_VERSION,
+            "status": status,
+            "phase": core.phase,
+            "phase_index": phase_index,
+            "phase_total": phase_total,
+            "release_sha256": manifest.get("release_sha256") if isinstance(manifest, dict) else None,
+            "swap_bytes": core.SWAP_BYTES,
+            "swap_active": core.swap_active(),
+            "python": sys.version.split()[0],
+            "systemd": core.systemd_version(),
+            "service_installed": core.service_installed(),
+            "service_enabled": False,
+            "worker_enrolled": False,
+            "dispatch_enabled": False,
+            "checks": list(CHECKS),
+            "failure_class": error if status == "BLOCKED" else None,
+            "failure_code": failure_code,
+            "failure_detail": failure_detail,
+            "next_action": _next_action(status),
+        }
+        event_logged = _append_event(core, value)
+        value["event_log_status"] = "AVAILABLE" if event_logged else "UNAVAILABLE"
+        core.atomic_json(core.rp(STATE_PATH), value)
+    
+    
+    def _wrap_success(name: str, function):
+        def wrapped(*args, **kwargs):
+            result = function(*args, **kwargs)
+            record_check(name)
+            return result
+    
+        return wrapped
+    
+    
+    def patch_runtime(core) -> None:
+        CHECKS.clear()
+        core.verify_os = _wrap_success("os_contract", core.verify_os)
+        core.load_manifest = _wrap_success("manifest_contract", core.load_manifest)
+        core.ensure_user_and_dirs = _wrap_success("bootstrap_paths", core.ensure_user_and_dirs)
+        core.ensure_swap = _wrap_success("swap_contract", core.ensure_swap)
+        core.read_archive = _wrap_success("archive_identity", core.read_archive)
+        core.install_release = _wrap_success("release_install", core.install_release)
+        original_publish = core.publish_current
+        core.publish_current = _wrap_success("current_symlink", original_publish)
+        original_verify_tree = core.verify_tree
+        core.verify_tree = _wrap_success("immutable_tree", original_verify_tree)
+        core.runtime_smoke = lambda target: root_safe_runtime_smoke(core, target)
+        core.state = lambda status, manifest=None, error=None, detail=None: enhanced_state(
+            core, status, manifest, error, detail
+        )
+    
+    
+    def _root_path(root: Path, absolute: str) -> Path:
+        return root / absolute.lstrip("/")
+    
+    
+    def _read_json(path: Path) -> dict:
+        try:
+            value = json.loads(path.read_text(encoding="ascii"))
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+            return {}
+        return value if isinstance(value, dict) else {}
+    
+    
+    def _metadata(timeout: float = 2.0) -> dict:
+        base = "http://169.254.169.254"
+    
+        def get(path: str) -> bytes:
+            return urllib.request.urlopen(base + path, timeout=timeout).read()
+    
+        try:
+            user_data = get("/metadata/v1/user-data")
+            return {
+                "id": get("/metadata/v1/id").decode("ascii").strip(),
+                "region": get("/metadata/v1/region").decode("ascii").strip(),
+                "public_ipv4": get("/metadata/v1/interfaces/public/0/ipv4/address")
+                .decode("ascii")
+                .strip(),
+                "user_data_bytes": len(user_data),
+                "user_data_sha256": hashlib.sha256(user_data).hexdigest(),
+                "first_line": user_data.splitlines()[0].decode("ascii")
+                if user_data.splitlines()
+                else "",
+            }
+        except Exception:
+            return {"status": "UNAVAILABLE"}
+    
+    
+    def status_payload(root: Path = Path("/"), metadata_override=None) -> dict:
+        root = Path(root)
+        state = _read_json(_root_path(root, STATE_PATH))
+        current = _root_path(root, CURRENT_PATH)
+        current_target = None
+        marker = None
+        try:
+            if current.is_symlink():
+                current_target = os.readlink(current)
+                resolved = current.resolve(strict=True)
+                marker_path = resolved / ".aef-release-sha256"
+                if marker_path.is_file() and not marker_path.is_symlink():
+                    marker = marker_path.read_text(encoding="ascii").strip()
+        except OSError:
+            pass
+        swaps = _root_path(root, "/proc/swaps")
+        swap_active = False
+        try:
+            rows = swaps.read_text(encoding="utf-8").splitlines()[1:]
+            swap_active = any(row.split() and row.split()[0] == SWAP_PATH for row in rows)
+        except OSError:
+            swap_active = bool(state.get("swap_active"))
+        metadata = (
+            metadata_override
+            if metadata_override is not None
+            else (_metadata() if root == Path("/") else {"status": "SKIPPED"})
+        )
+        status = state.get("status", "UNKNOWN")
+        overall = (
+            "PASS"
+            if status == "BOOTSTRAP_READY_NOT_ENROLLED"
+            else ("FAIL" if status == "BLOCKED" else "PENDING")
+        )
+        failure_code = state.get("failure_code")
+        failure_detail = state.get("failure_detail")
+        if not failure_code and state.get("failure_detail"):
+            failure_code, failure_detail = _parse_failure(
+                state.get("failure_class"), state.get("failure_detail")
+            )
+        return {
+            "schema_version": 1,
+            "driver_version": DRIVER_VERSION,
+            "overall": overall,
+            "status": status,
+            "phase": state.get("phase", "UNKNOWN"),
+            "phase_index": state.get("phase_index", 0),
+            "phase_total": state.get("phase_total", len(PHASES)),
+            "failure_code": failure_code,
+            "failure_detail": failure_detail,
+            "next_action": state.get("next_action") or _next_action(status),
+            "checks": state.get("checks", []),
+            "release_sha256": state.get("release_sha256"),
+            "current_target": current_target,
+            "marker_sha256": marker,
+            "swap_active": swap_active,
+            "service_installed": bool(state.get("service_installed")),
+            "worker_enrolled": bool(state.get("worker_enrolled")),
+            "dispatch_enabled": bool(state.get("dispatch_enabled")),
+            "metadata": metadata,
+            "event_log_status": state.get("event_log_status", "UNKNOWN"),
+        }
+    
+    
+    def render_human(payload: dict) -> str:
+        icon = {"PASS": "PASS", "FAIL": "FAIL", "PENDING": "WAIT"}.get(
+            payload["overall"], payload["overall"]
+        )
+        lines = [
+            f"AEF BOOTSTRAP {icon}",
+            f"phase: {payload['phase']} ({payload['phase_index']}/{payload['phase_total']})",
+        ]
+        if payload.get("failure_code"):
+            cause = payload["failure_code"]
+            if payload.get("failure_detail"):
+                cause += " - " + str(payload["failure_detail"])
+            lines.append("cause: " + cause)
+        passed = [
+            item.get("name")
+            for item in payload.get("checks", [])
+            if item.get("status") == "PASS"
+        ]
+        lines.append("passed: " + (", ".join(passed) if passed else "none recorded"))
+        lines.extend(
+            [
+                f"release: {payload.get('release_sha256') or 'unknown'}",
+                f"swap: {'active' if payload.get('swap_active') else 'inactive'}",
+                f"service: {'installed' if payload.get('service_installed') else 'absent'}",
+                f"worker: {'enrolled' if payload.get('worker_enrolled') else 'not enrolled'}",
+                f"dispatch: {'enabled' if payload.get('dispatch_enabled') else 'disabled'}",
+                f"next: {payload.get('next_action')}",
+            ]
+        )
+        metadata = payload.get("metadata") or {}
+        if metadata.get("id"):
+            lines.append(
+                "host: id={id} region={region} ip={public_ipv4} "
+                "user-data={user_data_bytes}/{user_data_sha256}".format(**metadata)
+            )
+        return "\n".join(lines) + "\n"
+    
+    
+    def write_human_summary(root: Path, payload: dict) -> Path:
+        path = _root_path(Path(root), SUMMARY_PATH)
+        if path.parent.is_symlink():
+            raise RuntimeError("SUMMARY_PARENT_SYMLINK")
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_name(path.name + ".tmp")
+        if tmp.exists() or tmp.is_symlink():
+            tmp.unlink()
+        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
+        fd = os.open(tmp, flags, 0o444)
+        try:
+            data = render_human(payload).encode("ascii")
+            os.write(fd, data)
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+        os.replace(tmp, path)
+        return path
+    
+    
+    def bootstrap(core_path: Path = CORE_PATH) -> int:
+        core = load_core(core_path)
+        patch_runtime(core)
+        try:
+            result = core.main()
+        except Exception:
+            payload = status_payload(Path("/"))
+            try:
+                write_human_summary(Path("/"), payload)
+            except Exception:
+                pass
+            sys.stderr.write(render_human(payload))
+            raise
+        payload = status_payload(Path("/"))
+        write_human_summary(Path("/"), payload)
+        sys.stdout.write(render_human(payload))
+        return result
+    
+    
+    def main(argv=None) -> int:
+        parser = argparse.ArgumentParser()
+        group = parser.add_mutually_exclusive_group()
+        group.add_argument("--bootstrap", action="store_true")
+        group.add_argument("--status", action="store_true")
+        group.add_argument("--status-json", action="store_true")
+        parser.add_argument("--root", default="/")
+        parser.add_argument("--core", default=str(CORE_PATH))
+        args = parser.parse_args(argv)
+        if args.status or args.status_json:
+            payload = status_payload(Path(args.root))
+            if args.status_json:
+                print(
+                    json.dumps(
+                        payload,
+                        ensure_ascii=True,
+                        sort_keys=True,
+                        separators=(",", ":"),
+                    )
+                )
+            else:
+                sys.stdout.write(render_human(payload))
+            return 0 if payload["overall"] == "PASS" else 1
+        return bootstrap(Path(args.core))
+    
+    
+    if __name__ == "__main__":
+        raise SystemExit(main())
+- path: /etc/aef/bootstrap-manifest-v3.json
+  permissions: '0444'
+  owner: root:root
+  content: |
+    {"bootstrap_version":3,"file_count":20,"files":[{"bytes":582,"mode":"0444","path":"profiles/linux-systemd-sandbox-v1.json","sha256":"8ca0f4edf4f2b0f2cb9d348a62fcb7dbec715955cf55fefeb97b5a179b0c91aa"},{"bytes":1161,"mode":"0444","path":"profiles/worker-provisioning-v1.json","sha256":"4a0ebd6cc27998eef79092fdeeb08a9552f15589ca853638b1e2647025f8b474"},{"bytes":2360,"mode":"0444","path":"registry/resource-classes-v1.json","sha256":"81b3775186ffecf4d8f2433f85521c1da3c6260b8e2fe6448c97ffad0a097aed"},{"bytes":50,"mode":"0444","path":"runtime/__init__.py","sha256":"95967bd796b16e14e23d9869965ec7fda7931566ed6af30bc182ea32d4ec2132"},{"bytes":10494,"mode":"0444","path":"runtime/activation_readiness.py","sha256":"c5a8736adf1c84787819e0a97f21c2ed699e9196918cdaff5fe67c8160448116"},{"bytes":12121,"mode":"0444","path":"runtime/admission.py","sha256":"d29a4b59bc3fa26ff282ad6fcb0ac466c05c0644a28d327dfe5e1d8dda300754"},{"bytes":1821,"mode":"0444","path":"runtime/aef.py","sha256":"0c557b2b132f7c879c3802e28db803650ca837711da88f3fe9c77ee9bab48721"},{"bytes":19756,"mode":"0444","path":"runtime/aef_doctor.py","sha256":"4abe755959978bdabd22891a6d4d02e3d9984f4672ec725c0ca1cf93f037259f"},{"bytes":29621,"mode":"0444","path":"runtime/aef_runner.py","sha256":"a9060f9bfa1c8958f7e0d2fa589e841a66e76e8992f602bf6d3924f8b260adb3"},{"bytes":15212,"mode":"0444","path":"runtime/authorization_lifecycle.py","sha256":"1955a236d35c596f8e0e2f827429aaff02c20f6784e8bacb066208671f2b2c17"},{"bytes":4956,"mode":"0444","path":"runtime/dependency_probe.py","sha256":"323cb7b7b9ed15ec19ebfae23ea3bb4dc43b4dce534eb00d59db7af2053d8fe1"},{"bytes":23124,"mode":"0444","path":"runtime/execution_state.py","sha256":"b68aab74867b6cfde1e5af5afa761d99c6aee29d978bbaffea738743d16aac61"},{"bytes":5608,"mode":"0444","path":"runtime/github_ownership_adapter.py","sha256":"d325e4bc7d629e36b86ccd6ea7d38ec06e146216a3af5667fa19addc25758d80"},{"bytes":8770,"mode":"0444","path":"runtime/immutable_staging.py","sha256":"84ff33d5b6b96014133584f1c419372e4f6f41cc21ea67ea65452ff6d49fdcd6"},{"bytes":15195,"mode":"0444","path":"runtime/operations.py","sha256":"06cc090a3b2cddaf1821f7d512aac504e836c1d64732a42fd7e857ceffa726b9"},{"bytes":9418,"mode":"0444","path":"runtime/provenance.py","sha256":"6b3dd2702dafaf27f60199b4709849f129e818b9737221521c6a1e3a3942b6d8"},{"bytes":9650,"mode":"0444","path":"runtime/provisioning_contract.py","sha256":"a08b2c9ee9211d98b952d4eeee5587297cec5d5d269757f9d52a451fbba3edb0"},{"bytes":7567,"mode":"0444","path":"runtime/scheduler_ownership.py","sha256":"c9068afd090935f93a9c73dc07e26dd896a396e13a543b84fd2784b1bec64539"},{"bytes":18886,"mode":"0444","path":"runtime/source_workload.py","sha256":"8c6ba22bbc15f4d1609604bd82dc8a0c35e71bd3b05d4f249fd3662dd8676013"},{"bytes":6947,"mode":"0444","path":"runtime/systemd_sandbox.py","sha256":"6380829d1bc4265c6a850225b18c5d32563e774621c5a0725797aebc7dc52fe2"}],"inventory_sha256":"82ed0e0fd6fb8ee7581aa305c992d2b207d9b60a1ac45396c43a309deb7b22fe","release_bytes":43869,"release_sha256":"a1eee6efa50b367d7ef2ffade4833fbf2b670c9b6476a7173d0679de663a33ce","schema_version":1}
+- path: /opt/aef-release-v3.b85
+  permissions: '0444'
+  owner: root:root
+  content: |
+    ABzY8000000{`s2YkM2XtstDw`V}3Xeb(d*MakDmxWmcP5^eL0Eb36yT%zdhr$x4;j(H24w5?J2-(LWALtUB|NzP2NGrK1iyKX2H3I(80K$2eV&eCC;<muiYzR-XB@ZZaqFX><S&;8f``|1AEr!W2xz5K(!;J-yaPi8RuAO7F`FJbFHolUN?VVdv#>g)gXo9EyBzW)E}^`E8JSw5fL{ub8%)$jZNU%&o~@jM$n{yA`u^?&)z@B9B(TmLxD#@RfMYt!3DTmKg?UKFqYt7p#oKmTU`)gPk$-`D?(|5qxNn%C)g9<@HF{lz?+jH5Tn<t*z*lTYJxwmY2klVKz&qXxBi{_y*M|Ka;T>Cdx|3DQD5OOru1PV@XBykPbIfA-?}H?N%i|LXax=fCg&f5m_Q^~b$MKHIy@#(U}bV>G>;-%Q5OcVMHREM{pmOQ(}On@?u9yLmRi-;y4p^kXty5RpVzlUX#sNuy@#&40c6CNks`O_TnI<XZ5JtJ!1}#qrf*4jspFl#Qm7**r?d<H?+A=Q}&{+f9<+46{r1^Y8g&ESgV~ITon4C-74g%x|aJ_*#8$j&FB%PMQbbH{Z76?^{2gMvdrhCxZV<dH*IICGp2}mcx*xYE+Ui#@PUWnF+^081odr4YQAF%r=EA5FLWj^bs&K!-}6Kvk&Pk?hlhZ*9}JtF}*k$4kw>d8bvjVlj(GLYf2=HX@8c^V?=P8^Jd9xo?QVTa6W$oo((|a*L<>=_0zaN8P8`}cnLfkz{nYd^Rz!t2dpG20kfX~7GN^zls?QR!{H_1LVej;?lil-_M7HGPvfwJ3xJicGaBbI&To>ZrRC0P=d63sieDdf4!&=7P5u64Kq#cc1pi2J-s64>ZBDwKUhAOOI$YC?P!DUh+-d!EA{yAkvE@B#|Imv6yYo8kw%)c+d);QQ-8qimw@**o$8Tv)x({!7*3Du2ZM)Zm&#mS$R{WuT2;eo(dha^j_FqM(-PZq{wY#lDh2{hJyLH@aH;<s`O{?2FK4_hKwFtl;J6)V^>$uxFI(iR{ylSTh?^=gvM^NeDtk?Nr)!=MOvM$WyTyz5@lnsDbciBFc^sYvlrTJv|G2InZw5zCS*QKJ#<vhv8yXoiYFzaXYT}@TH$pU!BEc=D1-0jv>o26Ij43|DPbv|b4r(LxfcBjKcw}%~oaO<*B(!T-5W1z{?8FZh1Mp$LxE|S(fo8Rsx<H2q}ftkV&)#P$AnS*wlOn0*p?#atxy30;KRc$co1DdFZWH8EdWD|h1Ttl6Xai{Exy{@OS81IguqS)-?>s{CvgUKh|X_nJ?Os3jJPBd5y;rFL(ezU7LhHR4b|FOtsDRwji?17Ay&IrQ<+7+*wj;ZrmIs#mqepNB-^6ct%_a+7QaS2$(zlJa(_A{RB4i>ngh-}5Fpy7ofDx}fZz)KBP<@3q3a5Pxd$p;OLK-LJB#eqha6Y7zuGMpsfohCM5R0N9w)slR^OT?^}Yd5>v9jEEQ)RkBWqj)kN0##hi;ZHd-4dh{6LYKo54%y@gR|0K>oHw2B>-HgR_xQ90`@ZKKGIPKHoh?Zp$UTqE?`dX!AW;Do5oZ@H-~1(*zv19`^rZ2JR51MfCU!nS8>0PWX#XP44hMTSn~cRO&`)9;J3DkxMNNIOy{0`sDF1+iw`Q}+tWqZk2I*C#w8C<p4zH>x3Ba*jk6=qxp&XdQkbVFbN~KD)`(1QA8K<H-{+BPN>8xC->29t{ccPDFJ-QPeEK5;#B|D4KVV=rSDyA10yCy!uK;jR(P_}N!ZeW%KJTZ!Ra`|^)MrA^79mRxd1PIIl@N|9-z+Y6OVRD&@nb0H#S)WR(So=au2Vex5CCY$GKokJ#5gk^kawP(32)YyBD$ySsVh9c8EXiPEKGI7Eontt#;IwTY|Ij>Y18*0=h}i>CEN0_~dR3DGj+2h2^IK~|&II7!HBeJc02)h0M_&TgJh@6ioftwtAQYh-u?lLG>;xF|^z$56)0wL^9Cij(uuU1OSJZs5pq7CMbqR;jVxE?1o~2q1=xi)Xr@$0*{E7{0s0++<<j3VwZLd_>0261&r_DF5Sc^(0&E7k}h6M*=7R0zR4h916Afi8LHO3(A)Noe<P)m}esmucJQNWOEg1xFGv4prX$O%b3y1bpIxlK60_uvEu1Yeb~c62vP$5gwr{M&x12J920wQ?!R`&m}929t7pjry0}d>v8K+D-a-kX-|Rhee70D|(yFBe6Rpb&6LBL%<IgGx!xLR$bE+)lbGTU@Vp_^D0Y+gWRGjoUP_cGY|k=&IF57u#FAQaZz9kS0fNIh67w0s#nYA=_oI=ium7nG8@4;^-DT{Az|P$w5-%nf(Pbj)g-#mm7&-0p+Xx|RRd%XBzeknq*7c#pDzxGE9poM4V(I`6~Ae>jt*lD7tj+hZN%xab_erXmh2f7tq9?*plvz~F2OL%-6hDzgY+|7gmk<Zp-3d#IFsBEmh(I6c6kBdNU~BgbG#U5|5&6kU=ZZi0jNbYkP2-20>OoZ+d2UpK0z#E3v*zaEiNSe#v?;_yng3*x}ckYoc6ZaYsH7%_M4u~jA2yVu;w_zU*>?S+;<2-A&s)EYY9>#QR7f58)f-#-8oOI%)k)i{;U%hFFbi=H+UXc2fF-TjkwZpbo&xJ5$MCYYX`VM#5|3N{mL55E<mLvR2G0`W%C5^k|yI_5cF?%KRzwp@4Qq4Xnq%f(z8YgNQA<w)nL{6CV;$Y9-X#8eQX}Kk6Wjw@xf8E{XS^;@SzFYK~{nkH;<X7{U89tqx(>5gNy)-uUN@iV9Qz~D&vaYdpYH}d!pY+^ef;){zVK38CQ9GyHJr$h;3em0vhQ8_zba|H=qTiHghbTm$8Y^R@ZhD0lb(?5oeX70}G%bU^6S3%-Q3WnluiSk)`(Mjou9SkXT1$*Mg>codQ;`ivoVCYcQTF#4P#!o@*NbK>(bm>6nCBrbFPt5A4;fyga#P$tU~V(w%W0oc7_s@faMm1wP2lamavuu=sgqx)ee;b{dev#fay^w0E(l+Zxp}edEtqis-7_T9U`O;GdbmBZYBM6_CL2wi#s}o}C=E50EGo7D`pqC07tt$F*cIC<kh&qt#L>6cTK^=7neJv}S|{sp^eR)))IoaLM=<#0(|gm-e4Nd;a3(t8f1F=j5^vhhvFo0xBRasMZ@|AwZi~HiY#%J!LMQ!ImA+i43zY)85?E>$PG(k^;tejn!986ViM_opL1i)9E}ihJ+}|@#BW`EYN1mYDQ%BhYoivaeB^x1HBKunaZ2uRu6XE>4D^X)Cv<A?2AQ$_60|M;#f%rG3im|ibXH7X;8e|474^`n0r4XXMW%89oR?_oL624DElqvq=h#HMf}w1%i*d{=?1*jvD@ndrotgdb@D#!)B$HhrW&}pz)e+zst|)kfP>tGt}!n36-^{Np$4qI-%wna1X_xMRZX=;GtgR>S!7AzBTwe&-<B&&`~f{;d&ZAhr^Jy>F$~R1abFZ&@N7+5Ab|eR>Y^qf)D^im^lb#+6@mM)qWz$&Iy*ss-vChm-pSbp2A=!w1l_}idmwxhhugr%&HXljLHu@mK;8Y>eNa&(i-NT5;_$J^+3DA(Xs3cj)c(rfhg=Fsd#&9<)4P513z&89553#r%9bNISIK+`b(`d0I4i|Lm=5nWW?WUh9zCs^LZ+qH!@4`G%oGth7tvwqq<MN;3Re_rX1!SHX3fGXYJF4fnDtb6QUf=b%z(VgoOM<>LVRwf+c?Bo34uNtgY=%xfW3@T#3`wdcK<>}MWIoEKv%V)x>Caymw>?<;xaBCWI2d2{hL@^;)QD33h)$0$LlPs-cnkhX6YCK#Ovhy7@oA@8^%}+QL`yBXL-GdjWR?J8GT(!&^KFeqC;Vc=%6KnokZMS#$13Ci&u2qxD%k9KQV;;<YH-64brx07%X1V2a#^DIhD9AgOqQY2aD}KO8jrJPa?HXBE>IdoeP8J8VJ6y+~up%ZghuKy_EWuJP0HND@5Ol-`RNym43Z3&G4bh>qZWV7lmUg502dkv=HE$E%*SOAv~@)iR=5%2FqG>hg?*GAmsx5;s^$XXTZ}+Axzo<;7bGL9~&#6I-W#|6~Q5`FT7!ZboMdp<GrT3y+<icaTqBzM4w0>MVHrfP*YQpXHV&G<5KPKlWbh3aVyc+^ht7;;RMt>Q1<k3s3s7L+a}~A+uF4)9orbW(ebT@<K<;Cr160&LeE6SuS{2Pa0E9>i}}^=pGp#IQVB12PDur?ivIrlv~zrzB9)38eor$m7Dc3S{p=Xcv(49}BF}H9X&Kt%&HgwUrE%;i=K(2NaZl%>?OxV%ajWNCJ8#OZfA{|l`u{4wr$>4Ku*U!Qo0rd@I{v>ep1%0zcmLmC*Z=oTk_~tJ!$}S@ijwvA(5db+8{&Purjm#bRg~~%#OTot_~oBB_W2Du_Coa&G$F6_@I5#Ju{~}d3ZGHByFr@=FquIj+^Q~TlTW#DJe9`+Ij>F^rRC0XtA~D=@%zqUOZ0#$D0!VO=9iNNdVJ02!Z%j-v->H%WPR<X*MOKD`eMGH1eDVu$bC19OXC5_uX^mSAk+eb%CtWw^lf>ve&0Tp(?yYLHywgZ2?8@Uy&cbQ(s|ZrJuW4VjAJccN=a8|DV<*pCll?xOov-Pg%uuOlPB3^1WSWM#HJYgNQKXEN=}M{Sly*5^2kKFyr+uC=^SgsBUC#OswSKzXvfrm&5}_(BINd`i+Gd`hgp9z6TQIM{Q(Q1U8{Z6K7Om3+1>n;h+ve$^5NCgWIPa#&XaL}F++UZmYCC<qTa{zdHc=yy2(|cOBgcGXXAN+vsE=3C7-j=VpIp2Yz`<yZw2TO{~>7wzOHdzfEr{6^Ghx#lOc0!_*Pu7m*t4+ev(E+rzlbDI|Y$17`RJzA1^dARm5n#E5yiG)rjaeCVNz!rU59STM<NwcJ<iQtD`Lazf_krTkUQ4;CbTB!uYoAUWLxnk?q@uUxXx%e<(L5D&EdP<Pp|EIcFCxg6)>+2+lxqkLil(&8ORvh8oFxe-2MfI)))C?S5D6z;md1!JKC-XQ&{ih+~hEX;~Xw)H`k0sNrDAE-XZt*R6v*ubdEh7kEjd4u&N*^_tbLp)<D?_4V{&D^g-A0Quw*w{%87*U%OE4q#KZYjGFQH@zpcyis`|zzP%rv;0*rUOGG>m&WQZw=V%#cP~Ia7GNzVexmspxgcm8zsG!{{3e-llfIHQ0D2tu+z1~RmdRdKlNaVjs+-JAArvS)Jr=wG2)lpK97(`x2}feXDp-~^M{=^nkkwsU@>Qr?M*!mj55I3wQW^Pluro~}dWF>H4r=O_taGnHhE@CidMx?1zf@QHl*fhAT~@3$l&wth!<VvXDr^;e^sJOxJ^a`r?FtM@Ave4vVM*8>OqOoH61Fm9t%mHg^2o?mpgQ|K&CgYx3%T+2WiRj_S%<M8pq__vQ?z6nFHd=h%8^`$)W1(I%kY1}qtkfmDhi3h2OV@EbttK&p^69!BkVU|g3n&Q61tJHIjiTO${@)!Cw!AbWuIn%syOdYrb;`MMq||t)lyH8_!A$~zdY-NiTy)19+Z{^XB|wyIT+vzEsCBwe1~rjI<!M(JLt1iDTeA?;r7CoU9F;fj~r{34}(*e&LUlSob7&NIo(>GIcV3#p(W|8cD->{Nqm$7n6YMxAwOn{K7lZ1x6=s-ou%ddCLn=RJ4y|N9tc#zU6Tu^V5-=QX}((zZphkF-`f+`66EH4B`t}uHZ$a|({c$)Yj}V7F`drRtL$?@54C&>+?%Qs;+{POBMkOJGBy~JE5c}*R4cFie$In|ejYeA*^j(E&_u*mol(|>_4bMz?8>HA#d%?4N+eFm@?p2el`253*IZH*gOxnIH+%N=AZ#&AtmJ3*x!{mOs0I<ks~1}mL$Ig&O;Gd_iPu@0cgeF$b1!w474k1x!R27`v*clPO2L?b#&iaUv^Lz`mv1SsjEkB4axTUKp`;O&M#*@Q3`>^sWGZ^VTyR^}W^z;rI5Db0r5cAng$jbJD>8uPC)}GW0AHmY%F00to+;EuJU!yK(X0LYBSClLELCc~Qn=5WM}#r$M)VIws+Oo#d{+I#vwQqQ9kd(Rrr}R6+T-svwrKpxb&KVFMGZDP&n{Ko6!<m3R@ND};G;Heagd~as~Y|3)r<XoL_9*)X!s+Fqks(0JD%c(-IrWF&HkWwJk_-p<07ag-4EYZ$CB8X@a}4VM1fqmzwm_p0#z@d0t7n`sR|bbDny0rVhoB(^uOs-pv?w{$mv1nq{X}&(Szlvd7`i*loqucr3zED4@I%F6~#xn8+9BDPOGEjbFBD4JWQ@1dX7jaB_#$aUQ{^`z;mHHsD*%i{%U`Jla34L#QHC+BR8C_?RZL~(RaKH%=_WZ8^Kk#Tn$x2;9qmzmmj)Ac#l$r*{3Z2d6*?YT98!iC|Bb*F=!lS<uDRW!vQvopPh3<_>~qZ_W~wo3yF`OiZ4Dtx|T14<5X5cc+RlrsQZBm4*|r|`&HjxNcESmKRpY8csV7=0f<RKp(&(@A*u?_daBRDlEw|t4+2|*<4F>#WSt<O>S<{}eXwr2!fh2&LObE2aECBPx4v7xlP&_gD<FIDrLx2ihBHSBDKG`Ao;)M4>dNH_1){-&Ex`An3>!3WH>tPaI;aVHCla$7q}Q`#AYL&G57@zdPh|;;digEbI{G2aLpI%N6z1^NXxp1q<EZJ{kt_CB>twNR_mC7;T;+<oXrdH%Qw?oR51J_jv)~WdS&JeDcd=8nX!!J9tk?Q=k+JLWktBM7{#>fM-EC%J<-o7GvD)H(Kr-*+gU<UC5G90*>Q(6uL3v_>^5kL}O@LA*^nR(5U$<7Lc;FJeBGl|&&DOqLBu=SY$jEks;2B|81r+Pr--@9&)63-=zHS|Lev~MCbJXeJb0-W}!`_T(MJ}vN+wjP1OHq~2)xP!gCc%gKPW7_+OpZFu!?^X+L92CmDrY0FP2Kr;V=44)g*JWKwvSKG-n?lav_W!KLv3b!AQja+;Q*l3i1V9lwqI9b$m_JS7Rr_9^u{ct*M8sXob_xp+JjrC^?LMJ)gJ>jzGP4YS)q)vF*@MDJ2>lN*wCL>p(JeBV2CNWY2E@IN|aD1?<N2gh&G#_Cwfe4=9UhI7xlS(1j{D8`Z~W7{ZpCqToF#pivS|7C11(e!|gKl$?HI4Ms~9KVgnC(4P+*s^2;DArK)^(B73Xc?@1&c!;3uhtWjQp*6r(5|G^&B2`OoISI*I14<Gn`_g=dqiG?+_uQuwz`wsv8q`uOs+jp+k<(z3nO4o2GYzM0zL8dBLeo?LE&cE~fkM!!XQa@~x|Ka(I=P#Z2AJ4vd`t<krAHVMV4}7u;V)+O|-{LzsapM`$mFKnr-ILk%G@0e;W)a=x-}$Y29U=)+kC0x)B1|)S;ZO0kFC4Y;bT+xvZnL7i3<E0*w)MsiV^9LeH$Bz*_<*Gka?CXCi`RD8wuV0|bc?Njii?UsQ+$%anu1g`UCf;jFj&B4LPzqX*atbr+ZyA8zMOpf?HShSe`DSW8<c;p*x?y*&gUiF9i3q6O{E+-)Ifn^DyuJCQIIdC8CEVA*>DgG7ER$ot5E@N)H_Ai_>lgQ&lWul9O@6JupY9Oe&uLha%}qIaXLdY(G`+>eAqeYb-FUx!eKqSgPKc<fHq7UK$5k5K1gRXK6g5upY8CTKp{Ol>OpJsfExc5S|zXerhR+}r~fIdD$xsKB#^z|;`Q0_;Zcj#|0SCi)rwEwHQ{KqE6elJv{7`4$cn|v7~GgOW5t!4xI7Y3j@Y`zR7rdmLsl%WynP`?ikH#iUwOw(vWnPRPvs^aB_IpI&>tIgE2u(10v|z@TJe-xb9TKzdOx8Oyu-R~V6a9NRcLW3+K5m{_!oxlh|Tvhh^q5ONiw@qRSTRf5|)@B3W>TI^&<W*%dqj#_9h)p8>Q}IOt~^B@VJ#qXOJb=<4Hcx`byK1sKee8IhAs0cNbaB>Kcv@p%}R{Mb?Wsd-U)p#MId~vb136oO)b6mRR=^ZpNzwR;?k!VQx4XBn#DtsE8zG7KHx67C9}rO_y?Eh)g7&>+bfm82*m6FX0rzmt5j;GIbKiNLq0$yAiVb>1{qwN3GA<yi9~w`G4YhaDn`%_Vc5Nfve@e7q4EteBr+TefG`o`G0<8`LC<_2TFnkER3GA4bpi!8)f4RKjGs?lG4P<e{V^V+MrRLOMdEiHNyY>1x|%kDTCzSlYFhHIR%{$)i^DB-hg&D)W1-7pX*<60L&(s*MSSF@=rKkQBVM$bJ}b6&Q4<rolKX<bimc4eT-ev>BY?xiZz86YV)!4`n1*k0R!dIryrZ$V>At*ejk<IG}}k;=d-GgCj`HqFIh5*O|wueFk)aR4TbvKPCrqUoMKJd2~2iD=_y1n@Mr%97%RC~0QKbY?MO76Og?1N>wR^e3zg`@N@oGb2f7=K7o$t@(tDKjV>o~4X*Q0P%m$wlpu5EaujzM|J5n~n7>|gqvYh1tPMO(lZT@*Kd%>JCB=wM$bTS#{`WKg?<wwzrw14S}lu(yW7WPSq&#GNzhk{)mylWpFQlv|KPONriUHlLJ%IPos-_lO6dv=PhHoZ>gDDHMTJ(`GgpM}b$ij=lXdz0yW?`ASeFK6i|j0|#m(mF8ju614=IYW1H%u~Uh4xdSBx%0jW@E@<wwk5}t9usQc(X0EM*Gpzl4}Fn<V`w@A31=8zC8KO8=!1T<M#`KYCv)MCF-XvviA_$X<1q?_3W*5%)Rppj8>bk8B%23HSp*T8Em;-;S<zZ(#NvQzmNHlsZ7}hCg8@CC!4Z@WD5wh{QYr-O$^K2+{~&w9AnVsE?Uyj~v1ya*zl<y@fE}g4tI1BKGHU4n12L*(u}0By=Uw|06dzzoNAY3nq;-5qmT2=p9|UR^Q9TF%;+^t(y#~?@b)o{;pe$y^4*;yA(@rL^r2AuNGNXlIRt97}7Ob#v&n6rv;~W`uY`P&XXnrC~LO`-OI1=UUS~&*D+rZysFb3*ehf34_K=gU?VT1A5%!p6@4BP!Zqpox`r5H9mr<(q7HA|&#7Mew<Kivf!zLHc?!^7#s=!TNdWsC^<apfo~#sX8~%UvN`@&F5X*eG+&V&0F(lTT$g02_($>eR1c4R!F>pb5VJ02b0u%cHD6n}{o@#(t%i<r8Ep$-Hc;l)m2IukY_8tbaAx9+<u=Ux@<%^xFcVOooKPVl>Tl+8iV&eD_USVwK`sjpq$Go?(ljoI?pwgbFDmNL6&Q6d9*UL4g<DNSw))e!!0Gpz-jWCDvR2aLN*N2Xzva*y%|8SHebX;%j_Wf?+SS0pKChd`8B-Pv+68%pn{B;@R@!WD8N#Uz04Pc=$kq5D`BWS6+>;n68Qrut{tJ_o~Q7q>K&_jo@sEE-^la%#Ne9XBCCogg4mPAj-6N*QJA@@5**Ogg0<aQ&V=kYhspfGyy~thTlgInYtRkaVP&+R>d%lJNjoC$ijl>Xc_;<MlN3kQL2w$H#ml~2w3}EAJ2~Cp;NfgBGqJdvse+P0u-S>g!@-%H84s*xRB2+HXBy9(!*j?OmY!SIpGQ(cIF5I!%iEa!?J`R7F7l6LcSAWfbXc8A!>meLj7VmG&qurz~!RNz;fDbg-zbnMJWT(B~K~OmgT<z>Xaqbh>OTZ5;oJ8AHun5N>3?yiLRrMTa6h!XjV;C4H((o@2Q?56&q7+*DxX7Pk^^&#LB9u6>5r{#?<z-%hpq#QsP|7E8L;ZWLIk(_B3qR*3oNdmiM1e(M~EDRBA&P-pN@^HN@m{ejX*WS;GB<<%x^+>=V}=mA@qlvH2@|OgG@TvqX=t%WXxSRv389@fQxkgcRV#U$Xmp!1Alrh$dGaVdnv+g;xut|5?&dK(Nua0;GL&AK|k<5!*=fw2R8lDiLTa0=z%r*<-CIJCEE}&%wS)-DE1fMbV6u`xc{XlA%CLyP8dY0kIk+zG7XyQjJWtuqIwv?rbI{yHl)e5p2i+AwmvGH?e}*ttWjBiC!YK`bLYfv^c{NCQ?zUm2*AeR^pNC_7)O7&A+l-O&7{sb`eB}TggKWhjt}3sYeEdNRUvvBZ}8PT7al*EI=sRrj{5K34`pEx=1&c!qs?ptPwuy-3n{4&n%QH7l7CE*1!RNC00z`O;>^seecC!hUJy(u>w)buVWL|r5#e%Gh$ga$WY9noE@`+M^>mt+zyJ&S+xx1A8|y2pvBZTdN^p20|ezxyKF;ShzqcHY!}F&5<E4gvV3Y+TYj^&o^kqMi2gXC)?shT(VmFXCl`O5EeqiB%*tzp-4#tYm3;kaxP7e_hCQSf*ue|bsV%S@?%3O#LL`&z%Zg;Hks{b?BvzuTA1QD<lRJ6tAw%{&TH=)i6PgZZUgnlpc2~!6{`iLzu9EpB>z!AR^o&@k+KY8F%YfUmoVO{__ZxMC3+{_6Z#?P-KURVfo8syo?yMvuVXCMTIoMf7VhTG362Eqb6Sx)Nr+HDfCSTZcI@n0Q!k_ZluE1O6e(XW&`u=L8#da0XRnw#tNFv6aVpRIP)A!UAu1GfUTz7OW-HdL!SGS=mR?-H#U)QRRP|?f6Q5$b8WL()IhfsWgHcUlkFmuCSn=Qs=3y0^X$7=Ky_C_phFj>qStldfbq($G;*^GZb?HzW`dR41SOyMB!5aeT;#`CJ!KMlw6T*PJi*g$WB-a8;m=jIp=ymy`VE!spgx(=@4)o-~{S(;7?l0$GP^`HE{h9MidjiBpnmZRUNMqf?fq9$T=$>3X*Mx$&o4QhD4e{o)aw!eQNSTlB|gMg@&#MofjI9BF4ybvjyL>uC|2K2VN-e#2D5@^T2BCi+cw4|U=#px^=;J8r5X)c{inUnE68_W8#J*}vkoN(pUN@$EWaw1cmO%nLOq-FAsYoIfowz8?%%y~LgS?$cqU}z|v^^+cOt1cOv$z$<SX&wvDA6!b4Dzt&FEj2^&R@zsU-Pf)nZl~N{X;pQ{6_?HV0lQY<F}Qv*gQ>{tM@zXPqp4gqN%?Dr(wx|xlah0S6sq8<tnXb_H3>_p>j`jH^4q~VnEt9*@KfCR-szc<fK}hBbU90t4+TfJy7Q<<@-Hjrm&&%KhhY+*m5ptF!)mb-^HfRmW?jpo@QMgeBZtxKfOTaV`Nhe+s?E}b#ZLyYF<(1(&EmCu1JNrTjKuMZKH<u8FJ7TzNI}8fEWOTSk|K<^vt1-Vj`pHb4XEKNyDs71=&p?aO7M1JA^bB+fhZ}wF#C@MUJ<dY&PpXO^f*P!LwB@;&heY}+p{j7%@T>@Gy!6mgUW{9e&cKH9pEx${G-0(<{l={K}>^Bi=1*Km_1(;z6auI`wi>_C!sG5Y299n2ApT{K6Kt`QHj;67wifjTHTq7DyvE*KCGu7!oQj4dlCb&s}BqVpnV+#@1`pSNg*!roxW=w9hG=RaTlR^uWnqap-&C%1Jj{7Oo^7rkjm52@$;u7*cuS{xy{i*zHttnYPf^z4E;vVwd>lR_#l3h=cx6S`=#lEi^9%tMBjd^o6s2Mqx@Oe@qlu&8Nf{^x+E|vD^r8WPimkGDIe)~Jm(ksTvn!PS`p^Apd15}DH=P=T06AJRoJO(cXZ?VL^5m2r6-uUbh5PC$k!G6ZdG463lb@7Pg8dNs_wv*+dWQBR2RZ`#UA30of6)ywmKMOfxMk%hk_{3H=fINeH-ZhXrOaiku{=d%9!2nhxRE3n?eDR;Y+=`y~YhWMh5F$+=!iok`C!THma^w*f8nr#f36xa(%;KSs{^bs*sRULY*qC;<&cQ-0m)Vn<=L|6CIa7el>cXtIHg=emFimItr;Xs>tg_DKaltC^C<t%ov46CurAbH%f`%-XcwLBieT*!7Y^_dlVtiZ?=DFZE9ixN_wew{B5ebm)q0w4d>+`h7p;E_vM|=GKH_fnG64}V361gI&Al4{#M!RlK0@&L2-*!P@BvGxYYUaxYdo{zKfe@y?1f9^*?9ru1;`kp0!JdNehYU`Xfc8^Sxv35R|#4Uw%#GpN-XJFG!YUPUF?+#f#?^rdzw#Mh1pf?rf>adobt%35B&-#`lSJBE(IJLfxwvx?mpHnj{RIY_a)DX=l_r-{W<dz3rY_H(jCgC{97Y#J479(E)ESXh5&M3)#WD*1`As%8WL*z490Xc03>vUJ7tbblOBbR6-{u9WRtfS*H~pr&F%9s)SnCAe#l1E>%Y;T|c7IC6-h>z82D_RYklesZn^KMUELMb<Z`dxKd6hFWC(ViQNe)Z--s&6Kr|zYpT*H5lg2`aTX7eN*!RtS-48jO;}WA$TMEUbv>T#KU`-Bv#5@>bcoIY{NP;&P#6E$ZTIj^P2BpSjW^ycvivyYryQXgD?@6Oo;vRp>H!s!>%Phrs;-|C)da$2{PD&31Bm@&$5o2emhbS~>g@F3K2@xt^1|@OvHX|nmI}eG-j-KWUFgoX$5x#yG2GjmTgJ5=A(wJmUS09lq7D)<zZ@v`)q$Fn?y&ANO8U$X)q-^ImV=KOd0Ai#QGP7-NPF)UPb^El$teC^XPwHoOCcUz%%APnp;rZk2Rptq&_}w{k@xtZ?z}%+wZv?La<1af)p=9!02X3*ycIjyd?xZ{x~@5`Z9lRCL@;BAZ9ZZto7b6Xq%W1{`|tW#x!zh9&3;I4>ygPU$Ai^r=PhjkqeuH?o~9bRt&8^#`c(!%&0qIp6@6cc;RCQnz}8_KeI$JRT$hLa9{Sev?<g!SYtVDaSn7z^#KiADre!s%h4HIlLV7hE%^l$To#UgQqkoED2i;b)r+&14Iyh3w*G-ZqbD*pVl0_#z?!4(79d&-RBlcmp|CIfz8rGch+GL7(JfI^58M>`t!)mlYq43UPCV?0jMMffv4g}5}1A-flW5<fT;a^7z+mjh?Gcn6;C6}!>`ha4R_@SP>kjMqxh1u5?LJ*=5u~d9nNv?8yg{p4h+FRDlH^6pUWDX3==b@WU^)6X<93?{vc_}7=m)mNjWy#54zD5}c4c4c(&5@i;<c@8|5&=d6%7X>P4#yL>3>dx1LMdNAv2c2+oMd7YWQ4r4aM*gZPaH(p679R>rQ>d+oqQC*x%La}_}ueixrn}QL{C|&TzYk@pW$kLjE~MmESA5GOOY2*WeHy$vzW2cW0GCmEKlU={Y1D~Ju#BolS-fi7K;Uwv*?ZFRsA|D$w+O$%J6v-w2<>fCcGqwdDKu5h)wBiOw2ZKy!~h4?wfEH&Zpwp3^8CsC`P%GV`Z$Bx?~vD;DNVfTE{INVwQ~TJ(I4h<#XS)IS01&mbz{|x)V&z_zgQP*{f^2UExHPm?k>be#Wj4uyjZAUvzIcpd$x{qAYDNy!CE8gd*cG>a=uUn1>o$&W>Jt{v6$I&8dsEvsr;+7W`Sg^S(|99{eoYqh?i2Xy^Fz!qD|78E021`4+eY7+Qt^N>C>E?2THR6{DAQJV6;hq9#6+9k6OQ>1UA-sf+?^p8bNtCo&1A;?f(j2t!uIix6%V3bY-8uZ${Wi7rD(E~$Dd`heZ3REV`j4Mdx(0SPzeP(}g$>&p^F%~D@)5|n5hizq+FwN=FGUPi~L{WY8730}6l!+`)oJl-&N11xSsH)x;4hpjh9&0g!!)EK58(_!P!9J2aK{FlGtD^PW@Q}J61Yt_{Rro@16!x!{PH*rw*==j7t81bwi8>Nl%(?9=dzlxzd;Q#N7|L=rk<3rTcwBq?K<&g<ZzPL5UW}A(ZVT=MUv?e(;`u5xC>8oHPi7+AR3&reeQjG$ev?7!kL3eBdA$i2|jxn*upv2i=N&vF^=KIXOPIuUVf1t_mQbKp+A}5rgb|DIk#BTRzfQ5?Yhj)_6?Nh`!oc(1njv(I^VcsM+(ISV-51;^K``fx5OHgmP!t`XYq5H#0p0fSydEa>JXm{b=OmQ*4wipky@rSZa)~g(BoR|Mj;II2ddfU~}*9K|cpJfyRtr6p?6~`6USvbgAHNqX&5E`+FqIP;ap5LVC4GHW+ZLQ(0G6LA{vDp|%Ey5^+rImx}7;0=d6;4eAYw=>LDR_?4Pm!{xz|ga_&r(np498=x1*WJ2#VMZ?+=*mSl{zIdpZ^n$fyvIu&N5H&=2Kn}+AhFFQQTI<@#FE|+`w<4P@R_f#f0VzMCP=7GI+E}KU`%%Kld7_J3=cY<?q2Jzeuo2x5P3;Jz8wZ-@^f}kN*dMkJEoi{J(FWzIx@xe}3`&>5Jdv|NXl0|K23oaF>LKfffBv$3E9#nNh@UUZZWdrOVzVm$R(@&^XaL{vR;WfsVj;H6A7N{>|fr{&Pb8W!G>dZWQVd;S#;W(MqN;@x3{|-BBUtP7mI--Z$ePT3z%siYSc34*5g`OWrqs(pfQ1TL*BEV00$RZ?yv&Kohup{I1pP_FlJ|yvEC&)=%wT{05E^VX<=q4$9DhPp!~_&z2g_by3?)ynFeoj$AHOoHf7^hNh8a`3(j}qELIngp=eSbb>s6A-9+fO)}+}Coi{>W9~@*V?UK8ntFg-(s|56*a_j!{H4Tn*$?HO1s!WHT=$f)l&joQco1sgDxOY;Sw9qYFs5gs_-3*ob1IC$+KcPB$t?SYs9kp`A1mq0PSFyRhh#(fJV}GF6jZZ5x}MZN1ir0tb-qz+y;Nj9wPx0OB~!d?1P~o;`XwT~jOa|4x#(8kExhZm9v+?E3Ku}vShs|_VgZ(|8amCp+t^Ot%Ha2?G0XFX-XyTx09H=FR!}vpv~riyJ`85XWlU8SNzz(h{Z%Z<F8ST%i;)$cQnKvbQ94gh-qnqa<2gEe&2LR_;yurBaxH&>JSu)EGR|Nu5O-DJOd)x(jx7Te%&+y+iO3Vn=I6~>2a!9FQE9}@N{fVXn5`W{PF9sO?nqY!O1e_EI*`raSW=%O%1I}LzCn~+0kKA)`k`z~7ZU=TG8;O*@V-pbv37@`6HY|F#+yr^`D`A?<}M>ohgU|KAHh+QT+6p;M(U-|TDZHM0=0y=#j~pnAL`;;CsW}o)`_*(?FP~?!{Cq?Azn4+rpc^f`C>}9gnD{%9u;evH8T%X+Vu~+k~b&R?c8rpzrm^D7{LO&u{%|0=6=!y)Fq*JC8gmik0+ndiC;V*8O&=+O0k0$n(q|15Pn;s3uRwfK8b%37yEVICKw1&1o2C9)sfff=7A5%?1o#?atEMTSatFAy&wZ(@I}hjUJst*?Pj{OP|a+XU}DY5OV`VkW`~WjL#0(am%7_U=PMerC_bO{1V~_9oEsj><<bL!oiLBg5rZ(PA@V~}dI2YSG)g;8r3yu9c!9e@a`#K9#gQ)_ra3QsG<8be=-GIs(<NH|X)<)NP@2iR1osYs9xUE0#vjm953`<?hso%2kkn;OBC7J!{bw(tuOj@XQjIQ4uF+n=Qd>-MBbBK?Yei%^w=;{0y1|e9tf3SM1mASy#|v+>n3eOQEK&fJT^6fRZ2~L8qA7;D*u>2)CT)?kWK-(o!5975iv^(<$1o2JN>MhH>CIIyec>+R(K7_wl8@51-dROqG6GwS=h_WJZ>7|=Pd%C#Hl^iVGd&&lt1RPwsXq0yP&dx#rn8mND@eGtvi%0*0dO>X&s4Sp0pF%3&^_`pMKf;nO1z_xB>Kk&{bDq|^+1EgbV%<Ca(hY5`Z-*PzHLgEhG7;{sBxH?IdgmUf|nuw`!_1WLTUf$v*#~fzWU}*e@-s@1AMwEn3qAiD?x3x`V@V)pP=>eU2_*ztwK`AV;|--nyx~JC!63wg0GsaEpEk2l{N66^ZM@73p_5Q{6KH1;Cn3v^$fXs8RZFKR>kkWctExsl(@Jsgr~3(Q?Q{W5*UN}mZ!f$V)xC#^XJe1960X<IJNmNbfYVu&TQ3vHtr7>gH&gq2;71UR>@~t_~LeuvLga`Pm<l`a_uPk!EbFQ{wVF0Dpn7|LA1X6;zB=HW~+$4(`q5vqvct8m3>Cb)XjW8&Fg!6#$kD{q%NMwcT99ROGlsxi)Ll<kBt9d0Fn$<oe0>TV35_-KBSImA3o!;6~*V(E9M|at{Z8!SGSRwg0N}sF-5;{uW3(QrKhVEqXWg+b8}#7sSq2ibEH%+DgNO;7hg$tAi{shb;k1O0|<5!Qv4GJ!Fw;Y1QOeIkoBKxgkwFPm)%%4Og;i-4-l3Laot&3D%|53o5Gv1aL;!H6}$N%Q1Hry#-+2ejGc2*Kw6=947D1?fDsR!@vg77$@&{e$PG24Kv&6C>Ov#e*&tD0NTb6%sD{I2S{|lXbGgj3?D}SImf6G{p+=JElR2U;a2`pgO!ExbNW2L~28vWuH%OT(FMaiw^OAp)ZogfZqo@}`*w(u`RGy0y%;M(q3k<^|jO#V|FP=t(28jU?OfOJ}N?|uZRX<*gb_+>BX2)A!fiJ3DRlh|4d~p!T<`_?iUM>aI*se!NQ<rp5b4t3z!%I@rB`-*1f#Xl9r46+0#aS+Vv6;QEZsbFRTAJ_JS4R=R1*V3SA({1KOcWo0_#_K;cnsBa?BRCEJ0<5CNbHz4(DyXlw-6qK7D(HZLv93AQa&J(rym6RtzDAmIFJb3@quk`I#6(S4J>vkTedC=rswWzh6dF%H#64^5`&ason`bbEX5s8)TlNL5!?V=76#yu67DMiqV7g!g0MBe&}M)V3e^y?A1J?eh0uut0NeabRaMa3iR#P3D+HGhh!aEx=420_WSW=-Om&7*IzFqMQ<$`T<pqm#xx(M9F=Kze5UHr_PQ#Y}<xas|@yD8ZYE+(=WSVje6Cgo`%J%e1YnG8m#j{6^#3Jo@j)uhu^f6Fz>}li{BcLazQtq#1^SzK_lRGh~#YcNn&q502M>HDA;BwYi3Zk#N+mF5lhJyd|?Bz?E^G7YxID4GyRJpG(^7OR90FW*RP)ez@1k&?Tbf!gRwfvG`FFb;ghJ77eg(;YJTa#YApbJ%@00O=*0)6n}%1WMd&h`?IJRV+45<&F(1bWzxc}2RV6K7MM7-|#SD0H`W00C~53e#{+hby#Pz~CBdO^B{ViACE_iMB~)f<FS6@!P7RPiwWiKsU<`R1N8qCjN14k<KB-c%-Objo7_@Rb3kz@)Ezpi6(-c3tKQq(YKRig0V>bCZ@=1z`B86b;WP(92T2FZ9q9oe363zgyr3-l}?DcHE=y!;m2}&xX_5KS>H8Qt=>r2sv(%5#w-Iiq~_~`!`7R(@7n+U{n7j5&dL9DPkU!S{P@$)e-$>R>znNFABLmxWcm+~(ia~;eZKw0*qv(eE;l;yq1Wx}z#Ig@k}MycH+TP<?EbR9i(_1T&33miH!0jO7Z8RS_EpiiW$I9^9Sg>VPnwQn$VJ%4*;_KNoq^3QlANC;%7$e-R-JLtn|0(%<VFq+cN7w|S%+c&7G_mu4=iovL@EiogTQHKHoJS8DZB(uF`t#HZti~u1$x+!R@a?9=(!d~eAsD(Z{-57k}&e6DZbPo%fv@AQ~d2S*+%iFo+|XZ={5|FZ%pJ$=Aqb4p@UXUG<49)A^Zc@*=v@&5*-4V7xXi}BtZn=ORA^K&8EY<(u+ms)9^OBd%}Btg1!2{6gu$;8D3Pw($Z!S74>IwJeeL%+%EDBm*i?WZ(S5@53IGBQmAN}cU!0vvZGy$aA)~=EzK(1U^=oW7M@!zFA7@LcqIkHRP#0v-h<oB^JTM6OSe!;{@y*Q@A>4Wn=_Z8>twN_!S$&69@N;%gT?`~OG5hQg=br^&`Fs0uad)JT@^h`d@qoopeLw7I|X`9hK66!(uX9ykRK|ta%vEA9TYoI2oCAG?Pt@s7=KS0!`%F0N+{g%A6lstx*G_KE1VKHb4*<0K<GLVazlEd8=!j=XzxiSoZ5Sk%c#~_F4rdPmU-cM1Qt}3v_am9c-N<8JJG#yTl9N0WfhZ)l=}G&i8uN>l2=}XbU07SqihVMk~dyfwxSk2invW6e>~wn?$R~$sw|KYsm5(!n!KquPgZEXmy^AH+o0K!KZg1sfL?FN@a8J|Krj0l`4_4)Uv#}fOm(Qil~xOAVRPwK^j{>q+TB042rHk5Ia6e!W6?Q0yUw?iOIb>Q&DN~u!?Uqq>P)CuJ}nq=J9*WX6`ip|B4fd*VG*+E#B|0fJUCUD(`1(Ald)@wW(PpMNEmZv8XmG-9~h=J`*>l+Ka<Casi{Bldg`b#)zp`Z&;emHUDmh5wTqj|SOs>&a0`B<nHIL~G0@CxsCr003pH_RfnmcVs6g{D0h>;Wc0{17!sEKWfi@97(nFM5kJgBQLD(3VW#CvWI)q$Xdf=316*#2sv0jVj1MHjKu;^6bTF%F05oTNZNyF9YO997%d8UiSa!2jSa<V$rBQEk}o`;ObQMBlFK^F^~TA8+zLJV-BfsHQ@Wm*s(vX@DoD#u=xO(g6l5)O|~z7ASKR6QsMEsY%$?%qn8!M!G|i1_n-E6X(;lqinppfD+OuKVO1CyF{U{G)SiD1)EQ#6jqY_E_Q%r>^BJrt@I%G%VP|<G6>Vc|Vz^d0;}epO`etD`=cmW(<`%0eQZMrM*(X(T8VEVQzve6QQWP2~{F9gvhTZUhR}<E}R>r=sHbLC0dM=k4ZKZd6H~D8HN)KpJ76=T}>9_fr)PW=_c#nIH~9<bskn*w@4epqH+gempZn93h5=@EtQL%u)a`+kE-=Hu<rEs8_WN((WcRv!WB}57nNR?f~OQ4xU~g)CT177600(TlfGHvF)qpwWweOquIr7lr<i3|;bTO6JG1!Wa^1SNr#@*q@`I_p)XxOS`VmV|%1Vd@IdovT2lYP<)JXtc)E&@N&M+3%vMRI3;R8GV*}WjG<8>wm@c_PlnI`V{=?$Gh^p1?}1uDba&I_HTZZ_BIe{D2@6`YK-K7X{qK$LGcKFPNm@VUxCb&BCLk9R?sveOuxPy;vN0V0tw*T9vBe=CH%2K*llmyOpZACTz_7=R7<zp4m*EVB@Z$;adL6W~q+nzEnA8O|s2(5MkX;2V}JzUMIQGjvD_A{1YK2yDA9P^!&$4R4YCj0&MJJTk=3hio{UUY9kPm`75)WUrmJ-}YMF_kP$Z$rnyUo1@9(!(v(xuEz>Pz7b5yAzA|TDaqz#6@UL3EUFbI%7KWja8ER83HwNRs6rSv!p-;XqoZ(0t}XFXh@&EOgs>pusrVtxO6PatouGbsSXo{~Iud}`^Nl<DXQ`;FaVP(%*PdQ2^OB!@!-+D3A#4}<jk6d01RF%(`7lkVXx}S)j0l6weJ=0U_FsCu3+?#=s7l2XFL3TU&52If0eIpm^OU|{*3qRwl4Fn3LQfVc93Wa3jKU*)gU9OPfp>=b&Wut5*eZ`BfuS2DeWJ4h4deDpXPZn2gmYd0LWJs6mI3#Xor*E2!&y^9jG&4c6#<)2W``~>3Ql>Qjw#2e4C3xmQPspsq<_^ZN8!d`5E*C3zo?K5&AP0p>O8R`g&`~+{TcmJ1nqCg!1DYNv|Z+2cVL`w^2?C$vWUm(h2PyK31mgUafSi<z=QV>7BhL%p{*J-lrqbrs$t=k+I%v{cg><6ZsX^?BbiP^WSVud%Zf5NeT*$H{*ubLRwx(h&dHJj><bxQVuI!Cn9@b!0U)z5jtCPL+|`Dbp4eb73WbJ=O{x3(xx!z?NEK2jVh#2bnN8dES_(TxSr@jZA0Jl*_hTzA?bIcmrga%BQ)#{iRHM}L6eTilK*Ki>RDFY<<BMTCVTf;r^{i8-RK$WwD(*ul^fRbZa?~fH+(hKEp6zp1Br2L47gO(#jUsEN2V5{FgB#J609H`|wBf}$vdsAQ_dsf?aA1JI$>xRvaPw5jMYn_uof1MdmQQmU0cDh{VAeVnDPrr<g`zREtZarHf69-C8&3;V+8rYg*KT=_319hIqcP2CqopQqdqhfPUyZI|AKb}LnA!f<M_z!ixD})kG&u$B`YedAbZu#@vsg3Ht54Val2=(_dqtTIlvTm^vTtnWWgi$hz$MqZaLeh~Ow+Nb@nLNH8RvAo78#TaT);PbtP*w;=dbvER#yoiXFWXxeasm>aJd%KlyOPH99z*|6!v(vZoavQ?5AQaK92mbrGDxK-nntk{m<Z<j%mS3>R_SO&#@ublEn_OmUPbz3B|>t6^(*{qwwR}mf_%1b|Nj>jrEX}qrI`VxfIoFBwDaFqYR>iWh=GMa_uaN!eFs!hya*zfnFuzB(l$_M$2FF6>jBx|00|o4C|_&jvsrS9|ElPV_kJV==OCzUW=lLF}x}gSar9l7M<naV)RAQmMN0r*9u~=6XjU2Fm6|m3f=y<aVA*hB*1jkK&HKtR5ZAvs&tR4rNqhvZ2_g#O_hF+>tt&u#)0K3-l}#}y@u9~^<sVbDdfVuR@E~(`TP?7sxE*EbV|dp!cZj5z^*tkOaHMzL!++2Q^{F1%`$?Fv8&thjmCC{yl52h=Xn7)9Q1FJ@inGJ3*P3-6}PMl);D8SF!NsSuqe&wv;I}|>Q4p1rCC&J7U5M3)qG2cT+=IiIqfyOy$C40d4$PyxN(4oDBG}~v)(}+b9dNVVr}DI^Yr_=PW)li1KN!nOrqO5>72HEo$k-j%U#&T;EDbD$;EoG<mI4%Oz9+RS`{uHx7kWYCw$KMRoNQmuEZ_5b%fEDwhCpo4cvE8&S`#75oJs9xf*>H@FYT~XOimiE+;IX?m59G1BG_%Nn=F{zJCZ9rnU333UX#nhI7U|E@<NNmsQ7bkqdd#L%*nwcN*HEF)KWn+g0gK4}j^Ss$Lj2l`8kjjACVq=k{4`qhcwhP7k{6lb(8dXkN~dT%Dp#Q=&|X+rur@IkJH3N$^Le!MD#BbtnA(c_I6~a1)7$)Ofba$eeu%5?^IvH5{E5!K%u?B^FkZI+45AzaV-`a|F^4JhTmyeu(^SgzWO&uw^@cqZsqR#+yZTo0fuCqbtN~8y-6%teYj29oc+!tOMIxs;Zli%zIH^H~PC@$a5`O4mj2zuCXFWu_~t>21!!8$+`9^+@~xBTo(=S2koPFv)Aq%^DV1)lEAhSVm~FhF>c@j4Ve9aHnPDa-<Tn6Y&}u(TA9Jx?8@#oo-zd_=YZzv)}y1mr6G6(WMhUs`0%FPeJ{$_p!`Y*vy=)(LBSZP;fKIG_cvnL3@bK9HfQq3o#Vf@x|r&;jbw9WSbc`3QF7)WpxB{PT5npg_pMC1v0eoXCmgc{-^%uqY3uk<Nt7Trt-fH|O31{HrHC1s+$Bog+CWe|JnIrM)vXR(?F>4~H;{LGXQxtV)jbLN-vAKxY)$}T8`T~|zO?-#i6))I1LtZB>vW$g6E2$M(m|PB{dvAmp^MC&aM*042(gbc8nzQoTXT(M*k26sE?gdG1<|$bDA;SlYO|W_VroC=ewFKA^j1ci9za+Z`V9WTReIyjEid+rICE8!i?Mr$Yp?V&^FFFVdxqzcU;QVOr9+vUHoD){kID2q9kR=jgQgvBK|J4aoUiOa4kGDgu`N3|3bW?~$1vr31a1Oa+rKgc1v{68x@T=O+Mrv@l2gz-ufqnhjX-P1a-I=}SHhw?F_2?1Dm3qNS83@=g-^r;VpQNdjCg@@@qouC!|`GyZgWH&jM8o#)nwqYQd}4z!-PhUkdEV0<-Gp%+5QDN(96wH+S%#?MZzg`HaI#kaHhy|EL;fJT%T+_4k(Uts3mS+7-(5y7l=5p&ab@oZb7^+CHL+AWO^&^-uNC3UpDMg!aJEWb5rB0&B1JwD(7d+fT~zqz{Q74bQ_yZJ@2QL{y+P*{c6C1>af`j?52E6R5vk_a-*PcEcL!sS6EEL1=SrlH8XGHehS%DL-y1{YpG{fU1Lv`t9K7`>PBYN0%tArqq@#j>sJ??*9c*HcU-s`7@3QD!1Yc?(psB(ljqqibr<6ZdlFf~6v=@UV;hsL^S&TwrL2QU6Eq{!8R+blD_c8xmhRVyLiaB6-urf<%_+MkEflpRKYW$+v)C8UOOY8!uF1R{C~_GkPxS0KSn~YU{=O5H8xA4is}O*d$1lUCwmTXPBX6ApK516(Dhvmy6~0Fr>uMPo#0@>*`@c#07YetnV^}FAl`9|punyO%<7#9-0bBvLRnc`QDq(DmPPhG6VPtsUK0R$8zYUtvgaXELdZ<YSl6p9)JUkC-ZLW47)^RMMf9V<wS#w*DHIL>RVN!IbuSCF*_lEE3vE^F(1uJF{_6{k*UhH+72ff(8thE)*1~je}Ig@w?Hr4iz@lE_qXq+`?de9368+r$O!FsIrxCyVrx@~4q96)P9P9XLY<W&DD%UG(W%9nt#dv=U=SO>%hZ&tohe-nvlgZW=A0vm!9(!cFvn7Z39k^lAi%a<=-IQd_{dAk35{@347{#Q)xFi&l!6lubs0PaJK-Y!zXw%*isc6v8ij^U9P!&JN3=j@?ATJh&IOw~Q0aCel857mMh2q2U3@U|AUjT8G0MZ|*|NrZk*c>9))u{C_q7B9;B)dx`xosU4#sG>eU$nq%#wv=<g=Cz$I^U^wbXsIQdHYjZzJ{i^3#3!_)ro%yDde{{y9z(8qfs$RbEqNV*oLzw%6h`grkAwp9S78|$Wf4<ZC<*0h=d63siob7*9JAYHj@UVA_TI(sTfJs{@UGd#4geRw0GmWR(pP^uzqmt*Z=<B9HailbzT~?mSz|nr=~IIVPj}paFdIY=D+uo8rK{cXBa&bmyilf8X*duoWR;lJVkucoyIC^Mk#y`(Wp)<Qf(*H42%TeAX2RvENrB$u%M`Y5>Ln^&?i{t>v<`kg*dR&p`gKAzpT<zxGg&rN!0F_J28l9G=IEvnUyA&<t>bRz=;(dxxVJuAv5il)D^`KDV;MsLX(;)#RkQ&XIa*t%>p_uQEtrpY1to7mvNoj_5NLodJ#zH0W)a@zS(yWQjdzwh#b#5WV1D~r3S}msN2TuPQKj^$$k>4|$#;ePGHCl8rJ^fwD}jl^g?%I@5wTo6j{PuE2xi_?M04FzJ?M+qrxw%^bT&yZxM}7}IVmG<w~v2l9#Mpg^$9G!*qr*I&31VVi^6vXav5#}@4ZqQ#{aUMhTGwMi`0fO?ea{#|M=q3@MRGE=;^&@robhC_G_KnAT%@JN!En$b+Zg+aqlIvllftf_e$e;&*_^yemCi7gynjE6W!6P?G<=<P)fh}-#VwC$4WQD^Sx93ZN8e1l<|)VlpFD&)vH>V@6TRok?qe}UY_hvukaSR{;0bxQvFf=2WR@*V!^gf^+#Axyl8_AvS0mrNo2QV!e20#>_(70VoKTV#@jrz>=(-ExDmLIo7&OQ*n_DXHv-G#S(1QxX&jM+CNoShSOFp7`7?HIQliHDE}Jw7QPM*YnL&*zN*!sPN5q#z8cCZ4$)@WvOo}e(gZXW{wQMvGk!VuHmhpq=NxTU(x#p2V1oFX84>~8UxcUBd`|Vlh?9>|jQ#Ks*lNszU&_IC!_F>b_Qb7VLH%~nbRcTK|D<pEmhtY^Gb71V1D)+zzO1AxEj1jPsVF)E&{!QyJQ$p{y$vD+MhpI>{R8Jf=SJo*c3QT%P`pqj)4>C)nIvXf#^}jGD<d?_=`G`3n<1d*6(x&;==|S^|?ox@!glG1{azPrq+DdUd5KwTn{!Kf`Xuu+wip;8r&MD(`NSQl)9toT2`1GXH?G<csI@cwy)HzkKYg!K0x76Up<(D`;SVl>$h-0}<3p`oOFEQXzJY5Wj1gqf1v9h1v1L7JD!IFc?!40Ush$|rFli?kDlhpCAM#70_B;0pcy*e8X%~1bW8|kG*sy%)W((LT^7)@`dARfxCSSppe=~X(T*ahS;h*~-n(|#M^6QEHxhFzZZL4?fbIV}TBW>-Z#)Yl?4;c9=lm|^(LJy3XOM5ffIq+6K_V2}>8OA6Tqi#x#avFdz+w<`bjYQLsH+mV4M0l6b?H$p=@UOkkhk4cOV7GQP_s31N5k@{srX<u{gl9J0B)1*|#$vPQgyE2(54qm!*dt27;Oi%EGdf{G+S1SJpS?Khfb^;;vL?}4RqNnPk4^A06ssxh{%jlg*V<KWb-h`;IPe6RWv$toZ6M?SOwM)3z7*WIJ(jFWxl>X~(5*YOr@2QCZ>j9dT{^g<YcR(#a$O|}f(~=iq#xY9*CD@3-CY&d^7!sO9_(Y|qiH`W+r~ByEB}|&JO0C9na(!Q^Qqw3-E*$2rvMwnOZ>pEG8rc^e&{mfP+L?8(M$XNIWl9e;mDsLE{0_lf6|je&7VzO5KBZ?Rm9vM{T${W{(tl~QRSVw!(lRb`mFY41_$+cdH!7Y&WWgMs(i{xZR#uZ}Dy*~Flz7HU4c?vsVNdM|F^XCgm$g~v*UCkZ@gJQ08g3PVGQ%ygf6MUejKMCC{N7n%#juc7AdA~4zbEnCQrYPfYJX2(ZHDnckG4dU%p-I|nM02O1yCg`itRK$4ESx*7MUB*m0hxn(GXH}q0W<r7pE(G+%D;mon1+TEL3~->$`>;*<T3T4e_+sJZgDsK|C1r$MFD|FXdapGXUfo!@lm3<!LJj@NuOapdi~5j`}T|^}2!ZS?ABKUK}Pr^)&o8oku(snH*?yjJAF{K{pP60GZNB@eS+kP~rBoBFY33Ea~S-^5KTK4_?(HOJn2qr;DWJSU*52?2N~;vHQ|bo1B!dLf_PeZ<j%a(s>l;Ao9$&&RsVShF3{NqXaU;zSv)pGA)=bmS3c=8_>OUhXG%`Sdo{@sjk+AUDK~TZo+;htCBid6)TSXy6$ufJFl$FT*WI&4|mVWg}A5I%nRqJT@zN#PgimVQ@PY)H!)Xm74Mr>O&9U>YO98P{6uTqWM$938UW7$TgUAaX+JkYmX-dqhz^`ApwgV;xx~?-eThSRO#|nQY89UxHIG5=IOx1TIcoI+hmD>WXy26N2Oan@^FTr@OKC?MN-d6?y}$(8pp<8P^Lz;p#Z*t<UUST}5Ag}X`)2RpU5R(^h~!>)RCBD^QY3@lksuA^TzW*9nK57uv~OF-t*&$48<3fBJIJoCK*ST5w;@eUw~Cejl`UMcd2k0Udm_BVS4m9I-+CDw*T^ttPNEMnsVN-$<m&3Dv`mZ?O>So}8Lk?UCz{S{C~GvdXI#mOM$Z~D&$)|mZi>~)9kq7Am5-kAc1m|{3@hO!;BZ(g5bh(0+-~cK&i5gK${;(_K$+z<$TE(DToVlKT-(LahS)A!2lVOLNvnI>I$R4k1I_^*byrY$V1ts9yJB^9&?CE=Gn;TO)Rp=fjn3dD<qZ4iCo|%UA18g9)1DlQGN%Y@W6s#5rN;}J=F{_``LWaezSWJH8HG`S6nsplYG$&#iqD-n0KRm>T%#R{gi_h@Plcf3QPXSpezv%B0MZrwI0&urQ*|IU1q7ufxorofXeyoP&C@mlFY@hH*0I4sb<Pb2t7mo~A(^)=aI;nNG3%?KrtH^nA>O-t60q*<qktP^<H9_o-U(j!j&Js&m`%RUjyhID*i!1k7*mw6ls$+KrYTi_2IGzfp3OVDOx@L;oJg}=4XIl?j~`o9st<LWD6NpQe3#YjEyf>I$1L%owDB?b=?h~bt+CIQ;vANNr48n?RHLm)XQ>>AX?q=YnuoymU!TGTJEMC^c8zi8yJ7oyUCJmG-b+!jRo#nH-Sry3?PVZDxdnNUF@#3L)0C6*ihkF~e?`5^t+1lw;|_}SVK6P9ZM-B@CfmZKqTCk2NX#-m7!otq20O#(I{A=uTLls`i3H99qwi{{Yz0>V#WY${BRoxa(<@pHn9;j!VO;hcxjM9LSENL1_+718&A?ZaO^=0ovhKA=Lsq@tS2uQMRSf~fQq$Tf;0qyL5@x|!@rnUAjTIgbC371A{qOmn4!K;uVpYljv`VknnD!rWa6J2^l>mD5Kz!o*qx4T(q4xVdZK?Mwtl1j>O0APyB-o9sx@0bUM?XL0MT-ECf{k@s0OQZTiXiSnZjxN*MYv4UvA)|kl8SJ32t~u87=l&+mLwO^>S5?ssru!_8Fm!cqwu+H%N9b6eUP}Yot(0b@MG9rJ-}T<@n~3V8~Oajw^k`3=ePL&H}w8{kWMjb(zt(%eCqQ455G5h|NZpo%jfR<@0TxLJ^TIr_rKyl@^VTByZGWdI-%F!_+%Q+giGNZVu%5?l1ua_myf(bdqmfw+NN)*sg5WZW|yjpdOxh5TH_03Q5F3MSw)PwqbkkNq37VJd3M^Or+nz;Kcz%IrT?$oX#DfL#y`J>|NZB;mA~a*mCyHg|9tUv`7iaq)x@8buPXlw*y{1w`&PGo5dYBXp29)v^%Q9LzsP@3IF21^%$&k;DAL_@#TMf487Y*VdWQxKeU|l=(?Xeh)o=9d%mKM}wE*6T;$+!%&=(JDLNH!g-Vf-gE5VAiEmXp%9ESfmbG&xRA-+rrJCoVGB2#M4j3>PE#IB)apq+UK<W?))cO|T!vH@l9!<?b$Sb#MuRq`<q)heE2@7GazzgmgDiprw#ZloJlWakBSRF4uOJYs>n!#rYG(nX%;W%H?USxgl-0AexDOKcmN_TEzs<sd150j!)OR@HMK3(ck%h3jgmBA-6#78iU9veyTIdqY8xRYy$s7GDS~cMv(a*sP3RMa5tSsr5t~1P`cHbn20-1WGP@4h$*3%3!e-y;mb|*+noPx&d|etZL*g)f#Hr1Xsce*C<35N2;hBH1|I?7Rd>Gin1R@-qFIpd~8O5)UIcf#WXLo=-$c_(^$zZtlliHp*mtLgWREji-^UkI**G9%nz3Jj%2k)1B5f{MSv6L={sHFyKseXb%k#Wde9w&+w10T@$y_D_QKsUlMib=V14&il76K`O34RAHsQL;b-F;MkD?c0&Ag09s;E+<Aib2D!b?O^+3MB#3Z}v#L*ap<<rTg_$GZ{7kKT{3ph+0Eb7`rcE~{|0R`rVKA$UJnmBSi|O!gR!r{qLyLA4Tn=k^RP*rP!G{?Dy*5BOR8;OletLQsctJr@+2qb@2;1%`)FpxLT^bdnN}#B|I-fGgf<;JrPxo=)H=x#H8L{~@_fDM*%5=~3Nc%+@t|uHt@%<DJXkxfgV(sV8sfpv#yZrS@*nG|z2N%x-1JqpBGK@?r%Fut!_W!!P>OS5GpFB@k7G%LHy@g8QIG-vYaF3OJIsI{}6F<!nTm4JghzPL&?amswoq7#Dljey7Ho(OZFZyv6L)gHU$p!AXaM^HUBxrFR5otcnv=4joybgR(=L^+>E@aPjLA2xl^SwZKbd83^Pmxj5<Eg>2l~*o`8VzoU}fU^Fegm#<)9arM|2_H>N*Qvb4hz=|k9=eF_h&^Z~Ez=eZxxq?Cp=vpTNq~po_4ZdG;;)pwayXk9nQBaN&_BFhRPysyMd?Sd>*i@sm94qphc+=KGAMKwtf~gZ{ozM`Vc7Fr|pi~<RZd5jzRCr?cC@0<4Y3sOG(qbyiPF!}~XMD14`d!&zNmAFF)0V$NJJqfc-nER++ST<%vPl4{m(0mdq-?a}4{z8(BBO-cIS^T9BDHA?=0<Tug{hP?@tWjq&Va}QuSN81R=HFJw7nVyNPv2Gr2rzl$uFyJ>L(o|{jOAi_@#%jQ96)O!&yLbqz{*LH0=n2Iq7zOXcP6dPdi7=Uh6QHK|a0dr(@~$fE*@Xw@8|Y6A4!Jg6;e}*#AQIUlXdI{C6H|{#|4Lefjd~Gtd6}{MGZ{?Z3Zn{7?B>mAw<}Pk_L)vGNd9Z(}cky8<IoW?_1zy3@N!qv_%jgf4pEI_Xb_c*x4SyW?~L`+Hc6PXFf!-*Q6{KKl>`XiNYw9wf8D?l8NYCFFc22ixI;;l3Y8C~qe60pkb+scbsLAWRf_K)l6Ga|$OaeaEzcTf`p4{l3Vz4hl+^YWa8mk0DIsx%!FQsMv@djtW|hP9&lLd#&#K_Hpxw0{XW^_)T%gXL5h>oMxS)BVcE*n+M-hRxtFsh!48WQ*uIhgZHC{rRC01t9fd|IF|lCxeSLygd+vRwyJ=Mz!v0R*#MM)$((M6Kvlv|SE%Fx)16OXS;#9ESxL;EGA(!7$L(IbdDQ-ED}LYnDQ@<9t@kHA1maJ;tlR2!e}+i_j4}*9)Yz}>KlLkNH@wa>ZInM?G<xq4g98vQv!Tu&RazBh@Tznt+AiS~6AhOnu86<I;Uj9S2}NiX%GM3pjh<gi?Z#7N&9B97C@acg^Go_9(a7n2RgJ`Q7d`Ffi>`ufEX-SQPfl}4K{lbM%OY|ck%0{SF1~qv4APurE_wb4eEV4`oHxx;tyVJ+*?}vhpX4NEFK%$fuU5mgehiU*G#)Jk2N1b)DbV3&qnZdHF6<~V#H7|^9OShfN<^6@+HeFF@cpqMzDbke{AO)$qMD45wZ3y;)%f&cJ0MpR$7DFf14B{RBX*6~gu`?LXoWQD?hkJ-NE3kDMPNG=EDPlUE!gdY6qrZBP78p--!sI?M_@mA#0HmfC64lOGR<!$a|sm#DbQAeBfF3xTF@T-xFI`L7|4R~RpDFI(4i7?qGvG|?-|0A)^3!1&PIz7VR==So=1uBN%808h+a}<QR_Pe(U(HZMv*Tcb=v!1XeKJseJuD*kS(kY=S!^|n>c+Vqqvdc?mGt|quH+0Nc?3c5^gR8a(_44u+%$wQ=?Zd{i<<KT<0ws)%M<@Q7iu`L8z%Mf|}O$ckj)BZ0*UbrUS2t1r40fZjmX*Lhz5t&yR8*)s-$#>r5r^$x!Agv0~=PDA8#5!?Yt*Lm9$3eU)TBLR=x$hVm3H@>~8<i-<y{3JQukAWRQ^+LFG2PAgHqPPY)Tn(3xXPD{su2}sdsFTq^rEVV0_ok_6eRbcXT2Wfq*tY}aZ2@C_-467nNQ#|>=oP2dB1ZF1EDYGz0Xzm-QeQ`pGBSp^gKonTd9kDVlm#o6u+E7*_nGL-05|apK`D7?_siYs%VS_li)oX1w`J^H>u@SnHPj)pKVWnI;={DcKZ{p@nv+J=)Gt)UPRaRF=l8H5F`#Q6im6>KdX818^i_uHf;K{a@Q-*1QXoVHZ%7Z^_OK}jczfTsJHX_F8U5y``M@|4b-bSRID|<o<Ql<OtpxXlNIqEfEAGM<Po9MXH!&G^vpn3wM%cF8Y^ogXH67^a?^`et*`+c+fa|GPB8m!D-v$l_Wt+%Z%jdFZ;bQEr2F{KUL2tGtXYzeGYwG6jXori0S=X0^c%vW^ZU(9f`DG_o-%_%z8P8RtFRr?@hi1TuN-Nh6u4%o~z+PwOe|FaD-XbV>nNrbSpo;ElktzO`*sYsm0n{>_3@lERAhd#v<)(tv$6#f;9EmX(Y^jtXdtbiuACZYmNlUha@J6FK*rqgY;-yS0^l*O`FqHgO=tBa;L!EMy{EoilUeAxQQq19~gIX3hfL#I*am{G7C#(tMz&=eTV<(!ou`!C}BC_X0hIXVZ>9WrKLEf*O4DjVE}x~H``b}E54Vt8DIu0)H(FA6;$z95w%_$slkQV){{3f`gq6i&Vd4ePr`RDh8cod%`(V0BtVG8B^qxOIFOzdk#qhbGFpuF$DW_n1fyBcHKM*B)8QnEE(*uL1@A&xdI`4TChw#>KF%Hu-)Pm7hgleWegssczm6vkHe>1vZ}`_Wz5FChL#V`ORct$p13EMwbl~VgiC;U^m#(&Fj|N_HopH|GstDhSe#p9t<{a;ZVNugo%jCauO2d3^1pyqt-zW(EFy_c`xLjAKw9kl07&60`#JoN2LPF)4YF!(HB<(tr^b>&_kx;$Cv{<w#7`Gfy9)YkD<BIOr(+bieB}|?Ix6(;+Yj#{VWR^n<P_|Lw15-d=2PJ#LeWQIz`D8oKjJZ1m;|+@E4Zr)J%kSD{>VM8V>%u^IBX#>GZX3m$ud}!uNa1{Kn&nTPyQ;I53=}>9Y}?k}U_t8#0(+-0J}M42;VJaBEb{NOD2%KCyaOwzgV&Wg9~*%s-tU0Zpgx+9&Z*=d@P{GB;}|0?=Rvs(eeqSGR;k1;OJ!TI$MJk*Uoms)cB<CStl_pzDw4$|l9}sz2E^AD?hqKeZ0dWN;?;HGOyzCK^hHqNH`fdyipN52b2g2v4ooRd)XKF9>%W1*{?Ml1egGERvasxRRu*^N+4Ul;L+V=8eQpV=rZ-;OLO5g?l~)46Hi=J<$ye%f<bYXE!ymmDe0C)~a}eSf%=|-(<L#*946}y?U{~Z|wqC^9zP2GA3lFIyw4VUz9Ax&2qN+so2+4R5Y@kmy{sPvYch96whJJ9tMW-{-o1`Gv{aZCfo)ge7=YD$5ltWCyxe2;!^wgwAJmQHr(NQYLyX`#UrciFs!;qNHu))RUP9|)in`SJws5{XzG>dhvv~)>$Lor>OTBG($x$9=P#8~SoYW39|%66R0K54jaPx}X(T?X)lhV?<E|Fl!Qc8K)K+8^ke7A>7CymiR>~ziz8P_dvA`O<5BF+tg_N;TJ&Gi}0zHjJK*Yoj4S-vrOUNoxF%C#|c%`x!e*mDyE+$c(4<f<`U@{yO$~>lzO2}e>O<m-{HzPL4TpcS#2hH>-IR!mnRQ_KMe!mN#S2)UY_pz|mb}d&S&T@8gh*m77rk%EW!dTe&3)|oDgIU=ce<{}H3dbs|`O@~TiZ^b9#b}zB?@TZZRcTqJSPkOVgf5G$#VN8K*v2cek2b=3$=A_S$1<fNgNx|d*15T}IcgP3Nqa|Rn$-g&T2R1mM&J6E*@EyX%nzWz<HpW<d6okYQcE5Y=SE};R1y;JT&+gl;V+g{Fy87;G1p#$JbuzKgQ+{dfBs3K&Vt`Q6N#v+F5ujVT{SjXhDuKO?3lCvpE%d#AED#Tmmxz&U?rN`%OKaL)I1PzcuGb1_m9m0^81s~D4RRxS}$;oUJ)sX*A={ejkN)2jMF}s&+GOq{n}DIuPdzhHQZCO?h&fr#^wWciCn*)cO2IBcCach-B(X7`p3GImZt}yKO2i+HA&yE!>*czQ=Gd>mL>ZN`Q-36aCh4uPIAj~_GLUUe*<dE<LVWnG-PFD77?+{9^>rrj*0;PU&+#=vgXi)ao4=K>F$?<peHk|uxsgLHG)#2&cqPnD6-+d!zOt=7vf)+Jj45N6I%EUFOC>8BT;>GJ|>sYq+Wx<^piO43v6QU&32JN>q{=QZ<~FTMGsp#rOKjEwUw1bxGTyl2nu7_)(If*%veuotS1-C-S6%+{+Ff7J;dq)O@*&m<Ddh|(dj{}Y=5tWnCT`OOj*NRwMfI}y1t!!dr|B+EkZp0LkMO8S9Oh*R)3-g`|3xj@}IEhFvy9P<{xLvts2%f%=#9fm6a*9u3pS-pzXGVNoUpl%X+bBYgIS0sAp5r$Q|EdH4a_?2ElEffX>=$;^V$28#0(;@O&QfpTRXA@VLqG5oTh5k;WT@LwSNV?n-(^N=tU&H!!q8`%Rm!LBG^<sTCn)WLx>tVdLw>(BlBvRjE>p9p7LaM3qK~^N62e?Om&R)O+_c87Jky(h4a`Vtnn2R*9V=8LD9dMA#jOcd|PHx3<T4X!f6SQs@P+FU&cHWlci!RvcO`A?D(v#+%%76?(C(xMT@>6f4`T$Kaj&4iy|xRoiNY2hHQdHZt^BokqT|40nmvK-u?UcxYY~l>qL|q{M4ttms~$In&zGkn9W#2awx;&@4=*$t^9zx|ga(OTjt1v8{Kd0RQBq+j-yVZF7V^{MfW|le=qLj~EX8g{*75{Cn8{9`ljyZ{ND{W!RSFLIpc}JGr=XbcBAuaj)5Z+v*i?q{(m)OS&v%O7?}9NF3DoH|IWL8dX03FUx&cY>p@Qy7ZLn$iC84du~3_q4Yzyn%nTOHI`#>k4Px@Ov&`M;5HG<0!oyF?doH2RkgMumde)q--4??FuuT+;RLv5A;V`$(_L}gndO7D4DFyGV}$+tnO@v5W5H)7_cfGQg13}kO545`(Iyg-z*R4m`@p#hMolT~4q59JRR;fZ>j~V)2rOgGJ*EZtQG8X(GKik%p&}#hf&zB86%T)aE5zfo_(wXP?{^aayIHM%6R}#hcatVRUK_ggj=Xk#^5nHYxj}v{yH;>^k74BscD${(^qQjzm-=Hmqswm-w*4N5*dsdx2jwbDwlbNeny)F8Yt?tw!J88~KeQ7KVdF2*>4j!mWie8X5QZ=<AHzwt&?ECvTvJ1@U^aW!vc|>JdeE}&=-<ZO^AS8UpD?%2Cy(r%xxyz?;D1-(f3T~$W9gnwn)mR4|E(T|40R#j#{#c)#&ak$#20aE511~(=g^8M(H-C{-5*5G%(LU>51?LPYz8;fbg^Ny(eMw;72~y!<I|sy54H<seb{Zk>6Lc;hyY%ik@eA@@8k05`Dkz8br^C<4!J-ExwrlrXc6G(;iU<*^-le|w|GUqj~m$oWCZ<x0|D?}QSr7H);15x^LWyQTnmpyumh*DPBoElyj^G8f4Mt$!5eeMucJ=)u+@!T|IC7GRK57PJ4LUMT%AU|Ne2?z#&^0TG8~ItNZG4dFgN&C!?UwoSq8SFnHO|&E_$KF4Q@C1QT1bGi!eQ0xEuEmzyJ4d^Is_b`!%qR#ifvd@|$cLCxc`<PiOZH1ivQ#=d*8K?mO|{zj^lj)$j4&f8F@+CyQAcz0KzD7MGw_kLQ$drg_p<S$_9`Sxzx{Iwi!K!5K>YL9^vZ(@%8JJf)EEaBz$!Scs1X2AG5yb)RW6!~8*)n7#$%RvZGO=~2`{irPL+XVCMAau2@i^-dH7)O<&#;}V$(f!_n1Su%`nplk?7!q#EkF^b=-7wglJLPsZ)Jo~&Nr2Ec}R`jVt&74^VIkGya43lxzPloa3?Hs-Cb%+o;uy&+G)27-Y(MuHlS2Ud^*Q2CPlSjcV+64&$gg97?jDp}N1A=KB%@Jb;mIr{cbJ~1^9uIHggLlm?Mqq~?e@Vv}r?k|3eQ?-%^Y&f)zrR0vf806wpYCbz?1vwJ`uVTPWgq09>znNFABLmxWcrU;K3{zN^!fG|-~rEHynOY|pZ;8n_b}_zyVg&3ucn6R1?r$xr*+(mbp~-A*dEq_l7*>Eb`;O_Cc%IDf{;r~-Mo2p)cMi04)^*`c><SI9x@~b>Nfj@elKQ2@|~KGhOzt`xTyMb04SzJP4agPg!v%{@nETgc8ZPGQA_c7q3Z+AZogUxdl@^G9_LJEw=CN47U7)TsJ8`}3tIim*iur)G?XZmT1jj7OwK+`8cTI3^zJhiN*V<<`B}!3?%ybbjk7s+fgtxvODpN67}Z3brnH!kIxjSk0aR+hyHX9S)oLL?9(UwWROCxgvQ&!VZI|1N-Yu63rS2S+99l0^00)ct{E(Rmpbb6|dpbloJs02Gvp=k)gLN^+?+sco(l`dyeK@)w0wZxqwaG-JUw&fByq*dmitU@_adMeYhNu`4ASHou75EqS41ElJ6^j6Sls+dpy#V}Nt~}Bd<bGmN<DcWG>UX0Nff)O!Ys>}@tuUNtPah{VKC(EIWc9_qPsw;1KjPF@hft?Pv{Jw;(^C({VB`rWh+qB?ai+tz6O}JfwMU}~JABNa0v6FPR+8*W{9}=@*jPNnqNARdM1VXrY`<;wm;nHUk->B#vYTBAuDN$-Kv?cc$ppS)_shS`(yPXu0D)(5D_u?oxAH25eN~w{V<Q2_I-0kYxNNDiOrq2s%TZ$`%a?`AdN5=?rEwPD?9z)ON)w$GqzEpem~QLzq;rf9JIrQ~U`mI2xh>EtAv4p8?^dSWpdbe<CSP1)3v8^J9sV#yA<6I&p$EY{9S&GtVDb4}h^@lq17&w|$yQ}rlojPdM=3o7C{hn}w{i;%Czr@skkX04sNqq1zF;%K-<6e%ey&CB3!Bw=#g*v0=;{8m7tvSr&m$mOf@WQ^&Jr|o3cS@WU%eQlm_0BAtWtKIF!F))+0bWA_G9PDmbw~~-mB3WXjD-1km}2C)YpHXc8=LsGSWf^55NNwQW?5H5g!$nI99=2KlksE%X^y@5CNNKlZjdcTXp28zT};X=Bm~yAZ)VtI0smMdew9BW8CR%0-cH*ka;*y$G`kY@%ErMpQ_26slSD>ZO=~)dyCW?HC#16SX*s)zIBLcK<A>PirxZA-p?`#h)Hf?O#D}+X6sGRK6Gafef|WFqsd~{$J^B>7t5%``d}f9yk@2hTZw@AUM2c0Iu`w|Kgv(e9&(fiPH!iNtHc%*$iLjIt&%&{)q1!IOMw9DW+&N&Qdy`=YGmn4?<GIT>jO!D0MFGBwn&_(qXe4u$!SEm61+ab2(s^*@%yvWUd*0jDG`J$AKBGyEO)!OG?jjGl--qu(Pi>1t3b-_v;F;Q^lbm>(hDD4I%uB8&6ATOe1#Tj-av`>&*63;2fR6IAM^?vK6@5!*y)1Qfi90R@kMdPt=wjdCh=nbX%%339-0J*FZjl_d4ydz&wB4VU3~Crb*U=Lk%2j%9rfa~<L{3<KOUEMwz2<bBaBl)VbJHvHQG=gmH~FP{r}lhIQHHAudiP0|8D>Pb?yJs=D(W^1~bf{I*2q~M3OGZe4orGqpTlkhd^Q<^DNCxLfDskufC~mX@<W^ax}MxlC4hi;@qk#A1ic+f)xHcnhbPa)^s#Q!Pn$U5)=8)$`q;$1kYZ+vQp>~#E)brc=f`!6Zls8wPphc|0VsHf8&g6d2)qf!sE=*H#9od(}%$?tw;=G54|nf{a2uP3c^hS`&C>lp`dHhdx?aF>ZrzKypwPC_X+J-T(=B>wxnz6XUYahNxX7l{!>Q5{C0#FCS}LtSGglW&y&11#I0Vo^M|pc7C@|>#_iLi<L}F=VJ)9i$|=3{yy9WI>sKs#i09%M1faJVP`=yg;2GTOf&@hGA~4k(!N`2oJr^{ZcPPUd<;TMRVad+O-PTe&JEtb!iLXa)4C-1f5{2}kz&}AOf0r@0c7M*)=g>l_#+DUf3;aI}@5X72fKY@!nWp1-Jh_@+2m?mscK*q$VRD^|xpd<0Vdwbh=jfl&HE`cKj55IpbDj9O^QMFLBN%%>K<-x(88~8Dq>Q6(AF`00v+hAF?wquab<~9Qi)cY*FVqz+)YZWA&*#h3ZM_ZeC;oAa+ZU6KhFtaw=7DdPp!2h%X4lVBcQx2q?d1pH3&%SSzHr%-YmM?nd^Lay0VQLQU8gy6Gbx4C#Azy>vxtb(^aHeo)ve<1(^l*I__Wm%6+YddaSb;Bd(eEd02~lv(Zo${nc2%jGS#>7bqNhW=r01sn$VrfRDDD6Bobu@H|b~bS6QXEl%fL)O714m7$O1=Y?zSgO$^5{E;En1K9km>$z_tS^^8g~ORpEhWaa{9uDDlFw0lO}YoBTJ@ZljSS*I4EZf<*9yN4bIhQseLytFew^uOV#erBn#8;$e+j8f>?W2nU<RY1k@Dx<U=b5Vg--1?#o34#QT%vQ9Xu!txM=&pIE)}p=v>TQuQ(Xx|%Wj2Ac<|x;?0ByjqTnrrm<8PmeSBi)uHbMd6d(VON^lFQ-5Pe+FW}M#fWc~)7rdobhvnlKwk?^)~1G#v+Cte-_Cz9(x7pWLq82=QF<REea*ptcJqZ$FQp&BD{I#r}KRck~}F*m7-FY?TxvB^s7$-o9ICFT4bO7azzqdhX!nchQ8RLotnQ6vN8BJ#nuzaPlUTWPhmW2idlp%3ybncX6ZlmUc>gpA^?TxFjdr5fRSmtsBRBXcQ4A_JT(<^fWaFpvNbHEQ_V7PD8Mm>S%`!MODSx&ELGADC+oPD{CfS$>*j;R;xIHC*I3&h$uVx*hikN4O&6NtsFdNq@eeko<v@*M8ZC)%d29biTRtbl85|I_;T|cvabJ#X4+n;2<dL1qNYZ^5O+U^p(sYpeTC}A6<)nmNm3C8@qgv^@~ogL|lG%{2*;}5f7VfASW=ynJx=or3Q0O>UKW2-JIiUt}D11ZE6*oE(RT)y%nV0Hwd4DjHAi$4mR^+H}N7Z(|mTJvwHu4<K2q4jRK4Fn>5N1BM1+g@Wy!b3vX2@(pNz0VnJE^ghr=QgZ^7EQ$41%Hds{a0K~~RUreXNj6_7@Z)|k}!mO&TJ(bV{L4K<l?<ICz%Yj*a3sSeygOvD_X7AmW7s397IO9<tw*mk~(Szo3=eT`9`N{CWSHnnlSS*%U$SFQ11J$-tWf2{+kjkw7fN9Yv%JP(RD~rUNC9x0Ek5x;;hJ8k2Q<=umRrD_`--MmBG;_zDL%h~`-8nnvK|J)K;^|k9ah#a(Y20S_=lJyO^=Yr&JCkuZT)wU~bXD|FP2F5m;~jv6U735uCTC1hdaN6^Xzshq>;<y2`&uuI;Wx4xILc;uqg<+@(YIcz0Cyhecwa#m+`_IEeI1qlHZE0a@-kfce{lU;j$Cy`B7Jf0Yu?kv<uHR)G%;N1GUZkWb>&iUC=T+c$?OApn)7p{@L{&#XyT^b^RLj~KW2F*FFYKV2!mxi$g;A@ua2|q!0MhVPBHZ0e6c-{ylH5ot}~DA&EqA}g<f6q;^OarDf!4K!Sg;B?{=SBck6oMb%rQb!<|^&#SN?L%@bc6yWc|f#q@b?@kQOqv&~Xfw|KXfn+V^3+~W?3GJH~Vvfbcdr;hgUp)plbUTL?Itcn|4-tH1v?L0sylCTD~B6>`e^3w%d$MextNe!ZgqZrALLXS|}-Ys<%39Uq^a!ZfUV!HvslH29ykPM{ObXmiNEbWBkcHS%N$`FLa@ntqfzrmPsS4}c5Yvg`G8?6m3I9nMx*hVX(0NZM5oY_3q5;0h;HIm=asftLOR>v@gWlf>7RBQmV`j$U7vwww5qE-hFvGj*6i^belMJRjSK0ZYG(O4G^KDaOq^O2Yn5R<7uY9Z2>wV?>Eh8I!OvXhNh_5k9L!tyq7wht{+mJ8&1%N|>|2ix{^xSpaDhMzrRuI7YMU#g1T(nhDy6|*w?Qo;8odVlB|iei3$?fswk{u?wc;YFE0(D7>{|F7pSUp{~C_<y~4{^I5D{$IbY|JQ5z9y^~8(8+2JL^4W&p9!b0#e6cJj4-6R2&)k#*VmxJ3&&jT`1R@@j$d1PdTE!gq9@p`AMheVJr3Rp$?F)8R0VpA7vt=6JO-h+#Dkax%SC7DM|?q}UIynWTK$02;-N&3_0Z*)Sg}+i;BWL4$SxP4s)~|9f_gbU2=2C|30FU7MhLRL5Mbz$@g$#vh)`PYG<&^n`}J9`<xCGYb?xtyORQ8CzhG;#UzZCKTjW_FKaP_AO*T%cn(0PcEo&?ak!+z{xogAZIv(ZfvuQF|hz3*`>JyIRxlA%38($^a5J;p(?s*!tbOh3VZJH(@gs(d9ZII<3YFD!~RYl@+Kba<dSclpy8O5VZ?{j~;h)3CQn1LQ+cc`mi&#WmB`fPrgCi5DRz(_pcZvE8m$=GbPTHUkbV+^-ljS3^@R?$uP_@H$pd^AeE_WRah+&SyPl49MnZYy@X-KLMz7G~b)wPn-8*6TBZr+xgUga7{6?4s~eYIVDvE{@shzHT3a-s_N&h#iHq@AuO@kM(bqKtAC^ETZ>5$RXyhm`p2FYnFXPw{8;&r_`TJK4esA{LJlNxp=t$F`G@sBlLL}KM9IyCj0vT+xzmTHj-rF?`QuN+Wz9jpjjjiGuW$Gy?7X8n;i_S1amyCqN9--(2TCt;W6Wn|NX1XtRt(ss@0P492*cZW9YiFs<N^&v+^)*^B4N6`VTbWOg{;-U^#h$s){F^a||7Q&MNu7KES_&&zmvq#339VNp_W2_v?&D<B=fM^M|MLS`GRrKMAb;(LB8qTki*zY#s$l3>QOf_GsIP1>r|iBM76EDZ!Yg#_sg*dW0`A!C5yMp_<N`qV}SKgFsGPwk?L3)>5Z289ZvcB(4)kX)Z^uLg1*GYr~1wnN#q_ELS0IkT`A7!lp<et4q&Hv>F&8`nyK__Ox+!66=mAVl?{WR3Y4z8y}jj2*Mqxj`0YyOE3^prLzP=K1x5aMMy`BA%LrV;A#bjZ-2&~9y^gz5^E<fWIVR;|6boUvu{`jRA@v}@Xzg%;f%H=7h_ba_-ET?l*s#ZpRxr}4b8mh_^S5v{whf847a2EmXAj2SjwS&JXt5m%gN(Z-}85t%jtENvVv~+hAD()*R)R###qMAw#7kOI&Jgaigy9bNH(@b!6jyZ!T)B0*GaS6ZZWYs7Oi0{*4<yL-;f8f1Ogdn$9vc+BG2L7-8F&1PRiPp8F+K&h_nsUF5s{@bI#B+Pj33swt03sH6Uq&T0fmeYXYpguUfs+=pYnGHMvGM1CA0II=mP4kvcFUNoEn4v?4mNg$`Soky<blK5%QPEW*W(9PxmmyP2RF8RHfrf221<t%z8AR?i)?Q(!MX938(uJr8G^)V5FVIJTVC37|VQxAC05t><YY+pdXZS-2f~=}yusAp)XV0;5A7If|IKs?~+ceEIN;$cSsniRfp{P}sAW4h9?C_aK({h-my`O(niCX>#3bgB?ZMK@!wGz}X_ahDtSXL!WOs$3fP!S$)-59uN5^UI6>M>!P~sB_=@2p5?O=;3&!d5yAFMXWdJ2f#UV;VgMT05$LaoU+bcJO#CyQKIrjsf%Rz*9AFCqs(Ly;6SLPrR1_^R+$ut<IMZSBv*JpHgyi9qWOAZBR!UYeY>MB8!Qv!TL<n)A%U`XO8Wb>CRYKa9Yab!62h+w-G6|g`QZW%J`IS*7`tl-^KtOGl?AXFUE7M1bXj*J&n!ih=J%+MLNEB&`iLkj}ZMx>~SXY+RP4=OQTP%rNetr=pc;wki2zi20Rv&j=^WhR}lgpada?y<kH85Owjo}}+rLfr7nvI0nC=c+DWd|bp#hR<sty$b5Q}NaqF7j{<jOEG%lVA*&Kgv93!fNtxcxu>8K+Qflp8AZb;$VAfdO3y~J7u0WE?ZD@&tUF2oM))<bDG<V-FY>3c0FzEE3amsYu{RB7?xW0z<b)cd`!(f|DHB3lT&l4LtYz)1FD5+NM0X`J*s7Bil<eUd8%b;PAG<n)E3y`&aAjNOl4vz$MB2RD$A#@f6T_CL94I43p|Qs*AF`R6q8}pOz8#pAT|knH{@A--9OylJ2)ukW%Oo!8Lc7I*@OHvtQ7vVrQnr05Y}66HYPm}8=`~Vza1)|u$VxSjvJY{UTc9z`0gmx{eI=Tm@ksGWZ7y2Hk*RU*ASyO3e?0~4pe<@Z~QxMH>04_{_HhhSpRk>Y$!4i<a4I-GD!dGtf`AMJEh3A*u-&OKxHHJ(`JFopkf(iF!&7^M;Z+R-ilv3u0hI{v_>x)u`G9o8{dH(eJohZi)Qos@~ViPx)K?6NCui#&7CSg<Sf*fs|A<4`#(U=`(29jWcC}DAV;f82ifhH8y8FU>eCw+YZz0=gF+;zi26651RA4Ojc<hW07x4vc03j3Z|#bE)@lrYZ~~x}YE!?sw(t^AwvtK6mh3o;=V;VETMV~A;LA3VU9*HI_d24X7!jl%>g2zjQ|>qfVVz2yw2RcZIvG#4cFP$`D2rFc^JYU}`bm6saS@+EN@gDwt5To`Z`21J>cI|3Sjd#p9e`O?YJ-kKc9qIcD%Yq|zkS$ylzqRktS@nIUwDdhUF^K3m$Jq*oeUCjUje||W|2M4Z@LT&G!J)ookWcSCyP>kNeB4xao=lZgYlO5Z^>bmVNJsl6F#kvVd60<O$~q4OYf$MSaGQvGX*z<l|~t*JJu|;)7C2E%^_SJa;l>D-gG=3nwH`abn(re2hp?Zs-AS!QiRN4q0a1@p00=r!2|nD{fYDo;;fBk{T?K?ia28^w!^5q#UJ#<4$~iujgm$D;eQI-!}oJ2WjjLZeq%&e5fv&Q_tw?=1BlunIHNs9Y=Ic_41h<AAHm#;^{m|OrmC9vM=V{O)=<LivdVQJhgcLqzE0`yC8wC-P-k6@o$jqPzZX)+{n!emYk&$OwuUQ&-fM%VIt)X$tHxe-COV;tnX>^k1@FHu%+!AYi1QC#$6xKKp@rUqu%c8%i^ga`M+!%l?4)aDNkb<qOs)913MaLjQZk#FezK2yV{llBmBI+(9{>X{1VZ1f;)dJCI$-e=wCPd(WlRxPTVaH<q&m}XyDA%^O6n~oXI$f&fezTb&I^|b&{NG3ETJy5Nb;0c?;s6~IAh(P(Syv*1+w8>qimpOGioM9eg9U~svC<uC!w!iG%HG{;TCZ5s>x)Mj(S_S5}ev+Ov3h+n&(%Y$C_%-BZgT3plKj7ymHXL6oBfa@veDvvH@5)Y7izcF@(1g4pyCE&=&(s4eW(XXR23EI^d~{;bD)Z*9m^1%%o&jsrvJnaXxO2eHLaZ4pOFxmy?zhM44BoG1*(g0}IhFKM4`1iAYX9r3v_kdbm_fCSFYG?=rm312XG}GHR>8@(n^Zq;1p(W1#41qCZm0SU^%XHwB2MV@Ug`VT0VigJgKqOOSHNbc%i(rE<HHcL_-WTHP5oJ^;Jw-X_jgJ7nAH=LKJ4Gbpop4HGWs7)Dxxtes!PXiU~(=WdY9$tpre_pl=!>T&}`yRv6g0Pw~Ea8Nzl3dK0+Y4(z$jf)lC+O<$sFvr+aJD^_faER~ZbGEGQK00*x4PX!b-}O9xcayt;EwiAW&8s(!qpLV@DJ+A@W`)1RmEna}x3sQMSZ)PkkR5-bm1`ZpZ=778HR7|QccH}#!t<N1ngyw6;WBn1%S}SErUFmJw=lTT<RGxJu0@5qNkbkCUx=A;fc<R1dQ{3)x>km<(m%2VcHhxD_WOoz?g(v$D4BjOl9YW5WF$#H3ZeuBZq{!1U!#1pvtzn1qbZ^u41E%IUswhMdDBzRb)orTIRl9G;XY4x40L8#1dl=Cz$XfwNo$d9sn{%TbqhMxa*6o5(FsuN2ITIfd2#U}bO^QzPRk=U7n@hMVfo7ttL&5+ox+yla{c!rjhBgt(kTWX0H`KM16eAWcBe}VK)X!A$^CHb8UhOYL%Wt$9dwjs@M17uA=-yz>1&FQ_gJZzhwP}vSryk7#o`KU_(EYmungi6u}HDZ0bld7Ol@u$(xLko88AG5PC7B!A=!rHb|~#g3U+AOdxSgno0KjYLTy~l*;^}Z$vmAx;7NTG#4_;-OcEbIirEt|12{quH>|Yy^x{wJ|2>(G1^R*H^;`IV@9)3d+t2ua@9jPNfB(Mz-z_0~_mXLER_Tt16LAJ1@rOZ;5(PKxlE=4bn-0d4)VO{hRA0P+d{4b`N*1#H;RFsH*tJd{CiAhltS0vl)l#c}M*;odu9Er21xZL}<QR@Y?`J3^E{5p~3N9}?oDPMU{;QD0wayhS1`+{_JmnI?bXrpR>q}SnsUV|wN%sL?JjRRZi)l*P!&~o<DiDQAO}0OPST^v;I$l8PzKJ;1@CXCm<(OI|Db4zKqXZn<SI#k>liXysxDksC2Ejp(_74{)(zTc7QZbI)v%xH>m`$P-)wI49GT@V`sqYsz6}HOcOx}QK`LXG~XjAYCdVAVvI{w3IXX2mxBl7N`eSlv%_DIzPIRb0c=y!GeOyxcd3y!(FWH1v`4p!6@vxK}KVzwlifLW?HCo-0XN(`ZV?ez!t_^PMn3<b{M=ifEXE-o8O!wpQvgMRk`!{spGS*$U+mn5DH%{!=pNP&R^x31s(qj7A)9Oy*lHjJX86I_5V3tV|}EsTftrADUzR1a&k(XsqsRiMNtb+vZ&mf3~%=`F>2;K+}qp}46^H>nKErSk0cXEO?jq+k}prE%z%o+R^WA`_)bKktgJt^ijZfnpTuZwf8GOUq8{pQWx;{#|~gG4yx*tNfUs?wCb=e9DB!Pn5`L-Q7f|=Po49k{3|)n|si!I9X3MB>`py;e?^g+nQ%aCbVE?f9=VbFmq2B!!s{-XYr7o?6HHB>n;78+$VKE8JCt4%X#3*Z<-CfY5Czho2!Q_PHirm7vD9`K?Mg6jV<}g)jDe(m2__<EgzM6;zBH=$I%$m7UNNh?&tH#thTe$A64e#`MBC2@3d6y9ghV}K2UC2S%gOp7XU^uX+2;n(yJ^`us`A+_{hYYjbL)dlCh+9cuNN|b;F0AxKvB|$ff9%`ixWATN_rq=LQcY@VS#+x;v{r*YzaYyPbSsc?=QyLUSdzWPsR0`sKiX-@G_~7fW7-@kQvV4!6lLnRo9kuiKdcm<FfM!F86c80hkg+$QPr3c&j_U3kD&%$E}xSwk=VgB|!a{$!Cw7X_!GYpiwLeORn6YZY{L0dXtp21<eqKcA$xz^wtF7=jP$Z3>$+m;)hD`5|mSRwM9~=ywTasrWtorcBK@1u;9I1Er2DK;ua)bK(ZL#|w-3=^}@HY|9vS#8Nxpv0YO#^Rk{l{&DyiqNHH11eyp#V(0$L2qs(V7kL9xmcR{fJ}vFnE$&@?-Y!|P=(bN@qGbn}6xe3@we3i&n)G2kZ8)NIxOluDM)Ui0-tT79LKb74qW%b1&nPPN><|X!Y)d?d2U1(O>-c6{4OC_kKUBAV3A*znq)^W=pC;PyWCZt47U4bBCDwN~#CijA2J@B7By%_0nv<F*_XFuYK=@TEl}L9`uV-~MB<4zGOJqIb>iH^VO2<yvKwo{PNuD|D!*X<Tba^HIWeH>4F3Wx}e2N^hfY#cXRe{mj3!|(muh*y3h#wxJ08jxnQXoW8{<&@bczJd4u6cC%{`5E|7>_BXx8j-uKm@f_>wwWZeRnRFMu#A|K9|eI-x+zFA$xz6N~@DmausZ?&E9=Vv9ia!Cyc8Rj1$?1H;hGMohk|B4(URgkmv~z8^)Ik%(O>m5JlI;3}x4J#~E@>9K+`%heR#K2y9doGd(v-c4{h!#31PpjmFy2-kZA|4^?agq%Eb_&sqb1&65@pQJ2@ZlPa!ADhk~s!wayIa2^U4Z$Q06IP8J^yj`+1v=mzsOV|Y@zXUu!*1YPSzNGdJ=|3BhtA#t(H6u9?=Z0Ac1m3wT^Z6D_a|Cecxq_J~tQ{sd(2WkEWe3o**kBz*N%1>!h<23aa+JUqU}<zq6MZX#s;dg4x^oHVUkspreCJuP95~nIqs#<lSTC0~@*E>06tp9oHOii>6?vrc3kySmkFnpQ?90HQgZ-}231@3t3BBdJo}uR^c8;yn@?KXVHC`C(Z5Pj!ShFPGjy^B;{%w1<scf55dn7CkT~^HLki=COs?~r}xd%LkFVec+lyJgRBcNC_uhdb?K%JBL#({Zx?i)TGRy}Z|*8+^bG6<o&6KrMlCP;o~t2-VJlTnWuK;gv+Ru<!hm~7e|k4&tHm%G7xEsCP%VpK}t+4{DBw*V9L;5#?D2G8!(!GJt^@o9aMOvP{V{Ty8QHDgkxgM4)_4&v=%)J0{Bez%{c1Jd=4e;J_?UQm?z6b@LTN2ZtcZZa64h=-}(X7m;>?gRM>1vWjvP?eJD-ADOaue9~);GrZ~E;#AE5)1!~%39nhc$|Va`>E)#s@5c+K#|MNbg5+Rj$hStkJkl>KaQXS6Zd429TcJ8n*Th$`0(NA{6rI~kj}?J32&g_OdTCESo^j)Rp8UhtT)>#0Lyr)qSMHeW)G|-z;nDuYFKHx09IjU6Br^wJlwSVv;IS%D?G}G&L@kxe7}JR7j<KBwd6;_R?n=BK%)BRM=K?c31h)Py`qMVPZLmvmjekG^H$8{$kT#rk;IF7>8eCa;Vla8<&}0zk9dm_`s$y3y*~POPPw_Uupp-GY~B-VVlAF8^2ZvBb#Z-ld2Q}(XIWILc=ugCN3BP=BWC!V%jGHU{}j!QHO*b$6mXgS-{GNa|95z}d+==k_xsxaH8oFF8IQ#E+)KNIM3Be|IdVXF3~@0{7hP?oH_+C9-@INU@k@?TT!B0=09DXpPQ|Z`Pa2nva|p|#l4HmTlRkeYE_zh$caustoz6)^lFq<7?)d8TJ5u{;+bKLJJ+fz0zsLO{q_Nil8(0o5W0KZO!9ZQGUJptkFmo)f)bab1*<AgZtaaQaj!qiKXGee}7&x_XE(K%6f=(~44GW7o<Ovn^#q!X)ut}?xkb#Zg?8Q5^vd;<z-(X`!B1lZ$k|9a5x<hfDKx!D&=6Pb_6tk_9y|ZUh`9;35Itn)(uEnawqNb3w2*u#6@GGzquo5YbKx!DK!4ZR-RluPg3bWyergJpKGb5XVwjp30^TH`Mwm(nA0BJHR@XDD13Es(1PnhQY`n+|0d3n*iYJ{a9A5bnO?by;;p(c5zZ5hZ<KODWYgS@lX9Y(~Nj*<i6koiuQ@=JA&r1;=|$C~@@gpmD>s^BK^k)IKryjNa9q>>GOj9D^dAs1erHLe;Ald?keG8025h@XVFN<sOy%H^kn&yscE?9uIx7A<%d+mZRo{A6WZUS3arVwF^MTe`1VRja^iFj|0><2;=>_09J<xt$9X)-<#~5^{~|L<(WwrVq;mui`Y~Hd02v5+1Qm>7XZg0MT_dncjf~*khEHTr;s})H;SkxX3lkF}GQrnwCcN%!N>!AR1)V7F&C6Qlw&5BeE!j1h4$>xhW+rn<*sd<AwModgL_Rj3SL}GNW%eSB9k4<sm`BQ9nluVB|16D?Vv~mQCEo3$VV8Z^R_T@k=Ihn$vlxEE)A~#-Cz!Sv_tDx;i(Wq#*0>Mmej&FiV7i%5uUC<&Y<nU1ul4!l+t}09cH6NQ@7}P@K;c13I4e1QS{={k`<^We&r+{^>OHvQkh%Dg`rR8#i^Pndr&Tu4)aya1g(?!`PO62-j_bSQvT--vs~IElXj!lIa7p;o+1yq<vdq&;k@)zMH8S4l6qrM{h1Ju3A^kqszG2I6C<;hL}Z-^X3IbQef{chPkboJBLRq<bfKktE*<;adxM~Gu8sEq^GXSm(_}KZ<a5v#YxpTKjx_>6IBbrmK~L^IMw;8^SJYwb@FJ%ne^~tB&lpkj}^_j$gFl{?vBl9b|yN%MfqyhNw$id$V@hcwA)!lo_6yz&}tqSi_=@X5ijZZqp&NgpP9M2qiTi{n2#<HNVEq7pJz5X7ZTkGlu8PdE#;t+tQV)F>DWJz*plIR4yKc{37G!H!9k0h`<g{;IJ!}QCeWw}yaJ!}Td3W(rzFqqY{xI6Rza%}Z3o&6`lH3Ciqvpb<V_!HCE%IuC}^s~9xLxy!BYW+Kyu+yzp)#wXVni_BNOdRJ2*|Ip!X16D47#6Z43TKQT9<i0KZ7Bg(y$~iQ#vXh)w*VL$AZtgCF`c(eqF&#m`(KR3^Qmqw%ad0DxF$%+I9Sicec-=ihFr7J_ZSM{Uha=vpVI&1|j0JVEQn^Q-rbtJCASDJVU=T_9B^g66Yez$yCTN5kOt-SI2PM4)3yQ>14rY5}x|93_K~;7$b3#4_Tva+W0R6GS}_`zi1Pbi-_OKm$1tH2q`h-K_3nI;D^?&_wfuz*A8K5Nb<ImSsAks(g;%hOOfNs{ZhMOV;!9=;}RNPd#Qbi$U4_iN}!^$lF7^3qWKE`wqgwVbirNbTeQ5I2Xb@-L9O?lKRvLxZ0v!pI<ev!S*5AX0uZZ7|+LqnBJ94Gd7K;2SQkbqHO&&zUbN<U1hOWIRjQwJaHdJ@-$J>nXg8wS;xOXHPB>*cfb-oO2iS{o7{*avk>E2VuOv&R1zqFjniL4o>HqLHG`Pw0ovyU&+xVd8H7BvCMvu5i(D2lnX-HrP={IExOeHCJYDFlSd&sqN7by;B0m);&(vTO0^Mx9dlCYjIUAnUw<nHSJV>36!n?x8qGLlgfpfwAUmv5Y_@sII_9{Fs9Tp<CgXC^Tt9TKEA>Y}LrT<5N9Sb?)O8wFJ;rNUi$Tc4eW>_xyHua)|<!3Z)Xn6!N`g_>wwkK%yFOV6rI~dQ>+uo8416E!D<#hWrsR3^LBf(BGP$35Z040D_R~&oO4D%q{C7a>#K4IvGl_-inh)UBwMk^`dODdRWSH{1L1XAl!O2&g}1Ytc(3B0KdFpFt5Z0Tf!!o3=;0y~Z|g#ybHA~%)1^{nhyVx^-awk?m{Q*>*7@8m*A=iQwoz1`6|g9;p|2jXLE&a@5RdK--=b8IN3tl7?IyRH!riGc+HQGTg1!8IVx8M8&Z)9kB2hCvTV$Zkgkq+~AJd`zZ->A%4#V-Gv_R;UGY=Hut(v(N;1erI-E-tlx&MEmXZxKw20YoKt2<g1F3Xe!c4GPD9-**`OX&uh)LiyODzraoye+g6q;bquHb6sy{u@*@kYM|Z)td1}Fvq?8pb53R#CZL_w4$6rf$(+77BK_8`%N9UI)YPbfI5zH%eQNo~|1)K-#G7~H2sE(ET8WL{q2IHHp=<BGwguk$p#aLG>@;8`_E6n*8=S#jU$FYhukVycdGMW8e91~;2ts35_9R??=iwQ^ym^4bYD_7@ZiNpusR^Gph%At0;jV?E_M@$wr$-m`{ts{o$p<gc>+TwTQ36nLr!Nr%i|5L$_r!g=o)7gE0vQZ$weEYw>!^6E-uKnNs!S1vD-|uVx_a+fXchswl(uLr&20GvBw4||ua!ZQ?36IG1o}nxNU+=GK{?{E(9`Z~9u`6*<61);2TOk$dPeJQH;!l@_WK-#RWl}9GdwqmcmL+n+g7S;?QDNC8;88MO%xs1TjOVAxXom4CWI$3Cbt47ybBxPBo=gOLU_uM%9(A2t^x$XV@E%{Zj^2W?N__nOs0s5DlmAsn_rT{Ly*WN<ynXln^dH}zeK^0k{AaUub^YD<Km7Q=WFL2T-~Z|7!EiL5{Chf^FFyYA>ETynLsyL}f~pG1;JkH;BBqcJT7vb!XY}r34txo&m*Bu|1dh<!5xc^y7%vo(Je>(+HmTw78$RxjZ23oMXj}c|$*IQw4Ndo0__$3?1Bu7%_ntUvS=J8JJ`u}IKr{I1b1KZY{QTqFxjw-peTcCngJFIgL~X66Cu`{QTJY0Treo%ay%%)hE;x$MgWE>#wsnbgoJ+;uLf<SMe$CjSUu0GL;^}0rB5GtVE<vwkOCCl$uthBUy3hBF7i+gOHq_tOT~-EKIS+f<`IlzL@rKK9?%b!U@p?009haOSLt-v`J1pEYNb2Vumik2(gARjd3HFUa>B(f)_V6iWOeEV!n?sNtq3mCboLw#{`_cUUeA4A|H`RX5a?WUAFSkP+V$rRTcR-dcTYsuc_Cw#aMfN06dA)tPY&K3B$BkC&q8aNf%Ela<?j^ZV@>=>Dct=fYB?GCbsr=I-mib{slxbm6+bmAzYa9|*$I5-c8*8Fp(-3oGB8$Y=>{(d0RzCEqxmgmjn_e?#-0m*C<yrHWoK3eXKNe#)IRnBVrs~|9Amdwtg<o&Ku%gPy%GpRXqx6^9#uEKGi!IwM?Irt=w^B8{SF-i&B~rBtB-FzNkkg?R(^*BdPSj%kt-Af&Y|s*WZFtlYyM&&NoY9tFn1Z)EYtRdkpgB(Svb_oDSRuJ1zB3Tli2WIvX1F=bA0xAIvZ;?x0upCN);1oTBU?Vbi|^0T#YM;*=kF{B7XuyZ+Tq}q_y1OAkiTv*#|t|#PTrNU%5`Af0bq5LgV#KO8TnL&aN8g1Y)#6)Ice5AVKeFhDy?f<X=wf$qTU*va>%#FivpzEIW0@5IQ>$bgxet&@+r8R|3(ue1BjwD^3iFzJeh5pbrhUT$CL34C}gg{nMWU;GSwqPbNb+*1Q0tvvMk5qW<$og;=W`Qea<tig<E`77wMJ{{H`IW5xEe;bN+`5@&AkS(_`PTA)(_hfeU1{!+Uc2uF<;6owp&gPfvZ#C=SK_0@T=ywI<*G6g<1+*RAa>z_R=6hq?BRICjw5Pv`M)L7IOem0MmL8jO<Uu<zzLV7#OtKOZCu%=kFNZZKBEVKZD7!(}f5tOXPM)rqoCbWzsHoN3cJfp7X<<;);qxV|DPfd|O+OLH~-u6#fUWIQIg?f+vQXXsVnbo2q!9UdRGS`hG78%do&@a&-wL}p|*bem2w5VELPx}le-s@U3+*ae6|A)hKKtR=oQNrjmYn_jTz27&H#{^sC$RB+J-9spv7Jo;5Yr(uPst7<PzC-95iKo1S?#%9F%VlqhEG8VR#k=xG1yrg&A%+Ds=RApOP*ef_NzZE<sjC%3xmt-PeUaWAQ>_$*FvyxEcn7kF4k`gH-L&I!*)f-IDHlOgq#BRxq9Fj{=k6N)Hs&CIuF}r}>MLE0wKIX<=h++s4YNK|IP5loM|3@-AU~2^i2^%K?%zytsIC!;t=)C`b^YZZU`ThTQ&i{v4AnjBYE|hL4$2=vL)n=aKsSv@y91|}*X#*e=0IK5z5B5VD0Z;~vRYr`45F`sR{<QxqcC?f9&_jJZ(vkmWFJR!_Vv5~#$K$Dh1}j%f1aRqQG3$>6BU2iT?*wRKdmqHmqn{`{7BmNu6l`o?=#+$_;67a=j~~nn@1bN?>dlv0FL-Pd@VmOr)JSUD{!+d~@t}X3b|1O}1ObYE)i3b09^cEI`wz_Cw(|S?mrNcNdJ--YXD43aHC=qNADq+C-TYp%#8344OnpAd3$z~z*LZ6O+rKYlLcl!v_kXhqQKpA@n2f{;78@K0mK4+po5V6!)FU2Jn}%?!$P^QWlh0%_`#|$RAdljUql0+RcsmwU!*qB9sdVac3Iw?P8iZVyJ5gWd*9{<*%V-bJ642_D=Cc$fMKEqKhRD<m@F@dHXbO&@1bvi|K2(s8J3()62ICtbI0)ne#;Nl$!s|{o;x@2?9Mt6@q|$aI-L{=pSl50@M7!CX5F1oJ8T9A6NSkkqC4I^{xzIuX)uh*ROuj=q)0XSp@!Cja>S&7ur^L3Fc!F6`zXpDToz-Llo(fwMb85H%F8<W$T2WA1Wnvl!yVRfrA3*|-%8$V);Q6|E7Q35}DU{kurw1rmUwL0Ts5b)d&wM3;*InuF%yVC!>zeWvFpIYhMn&~OGQ8;}7zMh9|5vDAwj+RpWW5k#qonLAbz}}*ci95fCU7^Djh`BZ8G>NPqGfzLO;eZSFe;6iay~1TKGVbMV2)Bw(h_jO!AL%48Ivw(4@p&2kF1Rn@XhW$CEY<E-xqNfR*A*q)=D>NG6kbkQ-Qve(ube;*9!dHq<275rVw8Qt-|oDtX8(DubGHhq!rF(t8v_HT*YUn-!|e8M^}yJ>Cu@uo78J2KbqXcT!i3$$P`H`_oZvwit)0Ik$>WOGW%KnDFu1<MagmaryD5W&=u^9?*ZlJPElSHT&mX3S%%X?!MY3FVcDvwbM3`L-dh*}6&#-y%6j^-aEM2^57lYl0k?{Uf83m1vDE%%G`{ZSUI{kvuU<!4xa=*V%Exby{_o-6qJrRE9ksrV-<+PGoSwh)zp$9$_<qw^-P@!hq|mw8zuCMpS=<a{79d}k%K!x5Uo^ixyEr-lYg-0@moGKxUkYbCOx3j@d7eOyatw7gpFT{+{n1=mp^v(78rb*84L04)(-_LTqI1kr!nUfo33g`b$7wQ}KkR_&LcmkGO}cdR6@y1UAvPPA7p>E)i)Q8#k==S$K8wJOM{U@h+vcm+F-_Q4UnB1#clhetJ$NONwxTngVE#}hWhkVej}j?#5-m)X2;gg%3w5Kj_p*;^EY&C*A%rVC(cf(c7{UpG3l)N-qAqfo7-xl(_U8Kh<cvKee=Cl?C!(rO{$9`LLW~&@AdiCH7%3he7}k=T{iy!egxbMevng7_Yx{O8gdC=-gCM4$khFxM1;q`Kf<vFoIpC&@*#ukIJk^x=i894Zmddu_A`5OCZ|7yzJ$=~R`_gsImvg-Jw5;PP^;w5+w2qd*)4#RGT)L&5Je#D@oh#q(zY`SsS|Ig@hB$?nr|0K*1hEg`mpFy9`KJ&rLoEl3;giH)rS^_*lVN{=*PnW|8YVxDrxdF36Dq0|t}6~>9BamG)`bjro1n5i8506nd~Ro;lu;<HCa7zp+SUZH?tVeYj;^oXUo=nummaS*obJVlr;7%&7N_G*q$G>^5gQ7D8I<&O32tyXJGPCfX~+0=!)OWSSqK5Zd4a+0Fr6pxG+q;o<Ez&d%^_F34Yqw9>g%>(f2O{}b1T4kN;vs#t!-%?LwdyzN0%(;5t;02`GFr3uT&8_EvB+_W=w%PIT$wq*%BtINP!teUx+d=OBLscVb63#QYD^ja%9+a4Gj9^n9{a{l}?Qc^HDKvFrXN#?wv$7+A41nnqPjr)zD<Y*hkR7qcg#szHKxcJSRFof;I$tZ^LUNmA_hw<apwhGCM(4u&%SYrdo~6A!7k#%||KWVZJo5pT=z^scYUJ73Tc4`QY){QLE)rH;{NK?sYvowk{0b@w&#BS(lOvfgSca8OFmKJRFlnEba;+dyc2XiS_zIBBnwomzN9yP4`Ck!50ErkBZA6#w#z60_|aJWQk^FsQZnTwYUDIQbC>R6?Xc-v0Wcfopw}||HZmn2EZzh(m9CuaWViUozFAFqOTaK4xWv}^~J3>j_I1pI(dxeG9@_15Sqo4bSgG@nDO!`h*c*-suk>144%6f#Glg;pORCHF^+CcS|yM=@~82Q-z_ARkA(Y-ILspR^RNUe_8qwa_P6gslf@zXL`OA9^Ve1YRb5ZaY)kxCE~sb`Rn5nYDkYFT)6%T_)C*i~U}|t>K+*00$Hg0&OEyQHg_E$>p5~I#Bp5k%h2f>78Xn%k2Q-e%EJ{(84q8WEG-IAdSKOiBowh9VPHVPLGglhXk<0Z#<9uz72$RPQBjLs0nVX8$ui!KQ^)VW+T_UXuaHlaAmFl$Ux+2F3hOLSd#lS)~G`?eLt*xICwK$he7^DDZvr!ovxD+T^cXfa=JO$6+q|ym*6(*OE_11Eo>!Y&M{ssx@hm$$ksCa3nZPTP1uaFH&j^Vx5b(y}{<(Cch60#RYEI2x^bBdk};nhwqag>Vos=L+Q$cc%r9t>F00REY~OHo$eF=PXXk~>gy(-(M8xJ_=R{VwlZU_A9p@&O?a+&GI-2_7gyFMv9!H5>wr>rZm7{Y?1T2>u+Gwo6~xLVv&aRoM#nuR#utqbt-t6U<g~eNjX7LUnUSDx0ytChd2Pwv5%#$44)c{<5t~-KENAxz2C|frQrzfotkOaMgg1|59jWz5c6@#_&+7A1<_6=-7lqJ!-tAgp#(=XflP|9FQ|w+iK3d7N}#)7jA6+E&D~wZqUs1Yx8T6J6uZgth;iW-t}h?`ZicqdM%K(nhB6Ar{R2-7&?E5rAo@*FSoq}!$>h1c+?-?*q@bcmA*(^TT5pWC_y>j>?U$Dps%Oj>|(t+bv;45LS}wazh-^2n~cVA5NF^eA}jw|Rqi9_P=*d9TaF#+C{25_*t|v6NiK2L2VOmA_b5YCvB4xoD^lYa!EP(-E(=~yfrn1-LRg9{Uxh;N*(>Vk-k$z&b=`EeHs~2OkseAj<&+Ts$W)B-gl$tTqi}dKn0w>y0wijTZmq{dFmI#JxO<Pa&vNG;bHUYJIr>HYU8)x|#u3^Mo1Ud1INDGv7g0H}l5w6rb>&G1s)W4xSfRMd4(t~dwbZ|t?MPH%iRxq{Ftwgnm34a+%+UL@F^Kxfd`opI=*VP{h((M37pD2w-QC*mE)Q=h3Fcxj*9SNSl?o=Fq0A~8psh@90=?uJ4r)8EuGxtEdTfvKE2{1D)DkOE7ytPRH0`Rp#LTYEvLwhP^(x2TcFCCPZ_DL7Qp+U~C7Z6^gs3QiKEJCB>jkPaG#3ToF40JT$>A%E$<iwwTpw^)a29}c0CDW(6|^2xG9oFz)>h)E+xV}Q6wbG|j^GK0yd8k1vx<e-Qbyg#%Ho(<CPKz^1C<We0{Hm4Rlq8ui10wBr2uXlU_+Ltq1Z@E5dcTJ>Ux&QwL0sxS%a0Jx@dmeXa=nrcnTc^jxiHLS}<&czM3Q};fTt%m`qRF;P4~e9R!_`CBWQFd!U7#=SMNpk~aA5cwZLLnRvqDlSNb*Nh08TKFs<_TH05aKi$rLRc3v5iH-I3<p^)Lx0Gh}Wk~6a4U1HFWU-Jg*Xg@}+Q{@-b{T#trRrOf+(;P@${<q+QkVa-&a_-<u3N1=hTrB}dOMaLlkI?zz_1-<V2C*@<>Sv9haM}2FEPiqCq9VV9-`&LTTmu!yWnc{VR-!4u4Hk<FS;++-O6^2QUjqIt6D|nHJ)@)j<vCqG!b>RDs82j=<qlLb*(ru5wS(1$bDqjrA{I>TBo{Fb2!UTcmCei>_kbXjG*VQ`r)n*f$TXtp%vuw&K7p0JBA=4jNdRSBA@ne`H8isXD6&uyID8t3#)>I$_0<3tJ<miPLabNI2tQ6|6wX>^^h3>`bavS)SSKEQtD_-Az34*f6=wLtHd;?Tb87}&BxzH&3HyG>56RxKi4g)>WEGj0)W-uAjR18xZ{-Sr5?RGyEy(9c@BdE``hxOs(+453^>UIh&!(N<K@Na`IVMB9?L6m7QtSu3Fn9`n(9bGMy<9mjGe|=c0F46VV(W%${|^8mNis{5pUo>sG9Qd*o9XA?a}Gk3QPY(<M^7mZP89_+BysG_EC`Y4w+@k#qrASUtkHEjn?&<(Xp?w08S5fJ`6r3Vj+#b6<J8bl6|q6iZdZjhliV7WwOCetobU!!_G>i3<k{0{Wht<zASY)1Ix+t#uf0=@!N~$o6{2k`$}^Tbiqgo29QDPG7VW^+ZE;RtBZrYNCXn}XB5<qDE#G7s};RiWla<i{v`=f9Qo{Ez1A#sry~`9dK>G^(0XvYj=sYnrkwgclWx~MJOu7+&qKqiOuF-sUn{M~r#pgw&C5l*d4fZaJL)cJhpM=PyP^DW<Fiq@9f%bl4$wMmdT4o}Oq*8t>$+AwAA^~YEi<8jz0T?uKIWMy_*5j9G9x6b0v3`8xhf+l|0aSl=CIE`7_6Wdz>HkS;+7Sc&OfhDArs!4h9FE0%BR?HE+6aRVTEBXuiu=V9+MjG=!}x}K@_9Y=7$Eq;204hDH4<q`ncB>@4D?}&NB?TS>`&sKD30gl;_g?n*yut;CE-)yUj}UI{d!FyJ6mLu}+2ve7$ZEEyq?3<8P0!n2>8Tq&>fg72ci_PF*(8_Gtx7Vy5JOIAn5Egi8^}!}VlQ(ZaB7HseAMk6#oypE&*(rHPMan)ojq|7-7?gM*jP@xT6X@xSbdj1nhG5+?)(j(RD$;H!jRhu`cRzN(haF?lUYk%Pgklz?ab$9^|mH5*uelJt7wc*v|?;Gi?;->4RsqWvW#TZ9~v!Pr`t&5O5iJul1rW&6;N#xVqGh5!QM;~iP2OU5XsW#C`#$HUa5?82Y}@q9R;D)eVBg%yzAD1x#J0*{jTY?8>&K%Ifr64FvKfUK^vLwJ+|4G{V-&7^PZc=`|zlTXZ&{@)9+e$c)vpPa$Hd<K<NNAhT6J7!j|`NFXvJr9^yOi5U3(IQCnh}LejALQiKC%9417<c=<=`8x<Daqb9ey}^uM58Jj6C^^@KUvT-8R`n%7OhxU5T65tC1eabnb=pwOeFJ@FyRoc`JugvQS0dZ<jutou{v0VgLi?4U?KpC7bA?gyMUGB5xvw*z(UgsiQ>fPdI^B5zagK_{;N#HE(|U7Uy=TRfB)-W=7W`(EV)6a2=R-Mq~VxZ3;#7=Yl!}t-u6Fj9CU2idX%4JBV^Dfi&pYn8!BcrL|^L9^g?XO*i0rg(*z<nWdb(g*Czo~N54}!R-IJ3eU@quP*txZfWO6B*X0JG`<wdABTvcVzm_1*RN+<rzH#(z<6IlyAmopw@nSv`>{sbCbqa?c0eg(BbD-g{untrXF#;A06{uov<zcB@#(LBc{k5RGNFixG+Hq5!M+z^dXewnR1_r>QO;zbiL@%+wvafH}b}BB|{)oI`@oO7X;<6sgHSMKBnR;adIOO~5Bb8Z)(oisV0$00(MGvSiJq@<rA7KPg()hs5sy9ogX-9G_!D;V0VCq`IEPZfG8H&VPJjt}wOjN`Pn&(Yg!XQmuImwDiEhW(qws*6LM8>F8UQjwZ59hNmG3a=n2}e^f72gVL;?2irSUK*;!Wg_xeyAZ7UpdWY9TrYFY1(YE=L~4eA+8tCr|9&!6=GGNiU~Dt{-X!AKyAS%SOFBcho=SMTI4m-0iA#oNRyEVksMx}{HAF}Jl;~<X3_JbJ`@4%eheoKtkjd~LuBsQ8AmmTV-KPmlsb_rsV^Cf75`AdShq0j6@J+Sqa4_bgRY9Uh~If?JO9-~Aq3^kqdG0g_!Ii}`It<1gvbWBgo;NBYd5o9QfzsqR@#CPG>6}O^YW0pIAnz!QFCv*^m=!fS2JP{6(8*W&FaP{1<8&M4|G?L+;Mrkv;{Koa503yZlB<nGAtF%r3&EyXImbRWPV(p#1|Q3nGz(WzbhU{{33z!ssIb4hW4120%3;8w_Q<D2q9cj%*v816Bd4NlORc_6(q(A3XgCCq786b0gRnXjFtkbn1miXBfN$VrmEnaP2HzFp6YMwgzAr*9MTM=78M43Q`gVu=;&>HeSZ1_G!ws`iVb1E9!8Id#Mnes*U)VaTuBCck?cE&|JGtNtw1o62b8i!hBd@*){4@XjUZ;Q7=owP1i$C`Y(PbuA;6~jG8|MXZ+0L(aC@y~1T#HDO|sUPRr?e5+-IN{S0lypbd6k$V#IGrz9QJSQGbN&W$F0zq$wmKfItXDUV{?>*A~G~wiggzb;Hqxs8uoYpbdkLoeGM}SgIvMysu1%qJ%V$#GmiHk4-HJj!AsxSC{ApsV&wUKwbj~H*IdT_O-ye4zoMFjZV^8ciKnGr8?waP#W9Ms`IZ5XZcmf@?<=^ou|{f92=bU#DG-+=Ur+A^yI&{TeOfIhUn^HlGcUbFuNaH4X?$j*MT2k-`-8fi;45`)(AZH&w42>P|wHb=`WX>@vT1q4{M4qiS=tCi&&S;VYd9e;0&`(kzu|XP68z-#7VoQP03ZCYo^+*aV9YM((u;-n7>V@qjYe!7y(x`%dPZb3}&bKb<W0jp$f+kw`)AW9SBaRb$xo$dUtvfDsQIA0GKMboE-H|($T~B;91ci^U7>5!|})T^zzs(xc(q`x%%$zt5+6YP_G}7Pj!RN77Hmb`h(Tt`11Onz&Wx88E#TE`Y)@|6)=+aD4Msl&&+MqB&Jf-Zlzt;z{6}h$4xEa5mD~9@`A2Mpr9&6)t|=w(N+!%!&%!FP{;Y3{-_5_UKhLqAL;Z`j^Pw`G9rMCfgO}**u942NW~Wy>yRcr+-lGe&BQ|Bku`TN++}P8KerI>UQgi&>eoL*1JylM6<04*ZAWl_womB^ssn#~pFoP2HxKpULf~p;A;^#>Yl570EKN!DuaR7O?Dlua$@F{Wf0CO%6JpzF@u?!8{3`MSseIh4Liq5fe*fLw+sovCdUf#fo9Fl6-{J>E@qm>f*Fe?4kj#%1NJ>1as9I?*v&Om_o0?YFSf!|@v052LmglolXt5%nVv7}L6kM##p>s9KWLavA9f2x${n4FzRCUYd=p2O>fEm5U%hw0^-KWWTjSe1`_TrFg`xO>14|l1B!zI?#6E_OOwTzf8!OmPHVzSFb$&PBvh;@zfo;<#IeDQytfBuu`Ke>WcFcu|H1cCGGQ~#y(e}8{(&!zwSyRV+<{~wF~`;mf3_%P|-3uZ}%u&T*;msm8Osj$H64x#VKR5Ss)znCJeN`}3|11h?K7qk8_xl3aeTG-Gw)7j!iP{&1O|Dd{iplBOKd{#kJWhXj1yEgwbgde7vbbp3wi^<(I>7^=0>dkmOhv+nL`P@oVzDJ_riD-gB6b54qeI!BqD2Tf;(O1zfYo%}Y_T?uGa(M^e_I7o5c;?j2D7#YchWM5y=9+zPl|9NU$yCg_uPBFVsODUoF^NUL?Xxb^d3VPM=#f;N#K1=5&WR#D83~`6iCTQT^<{{DS)$TG;+-3VsptTp@J)B;GkZxDeJD99QeCL1(zA!5K(e3Jo~aq#r`?}ti=m4F8f-Zy12$^&WXdF30m=Eue*wA*9f_)HtZ)z|_g)Z>%x-`nw6q#AT1w57%ZcgfNXEcShm1>OF%Vw;Y#I1i<Ha1`H9`kP9jjYW_KRQzAVZNjIT&kwh`NZ(SrIiB$siV>PG)fe`Xz{xHGm|}0-DKU4&-9@nT7Zx-2ckcdq??xSCF2kvrR7l<@Y}%0Cw*G!-H4*&-efDegDhd*TRr`wxt5e7U-K^hYth-p)N-I63oPXhI?>#mqmYu5BmqZk5-2ma-^FIVMW|!R;M6Uc{+XV^tr!#@Y)ksT1rxObZG&B86A_Q&--w}7(mRb(B!qtmo{FIu@qup6mA6Ab0uX-^J+@lpl<yNUB0Fp>AkPLwm_Vt_M`C#ZE+Q$u3+LJ`8*)O_U;lqXZ4b4ugFfx)yk~uzPnZ89^NgyRbbQaMF4lRUhn;F-@92tD9CQs{)(Hm&DP@2uyHrj@h>wLSt4iOz}lhEzCp#}M{M`iexZHa+uwivy7<QJZLo3MW?i0W4^591oqcHiZDqavlHL?Ko)!oBG^cZ=T`qh&_YR5XW_KA)XfoS;u-P`Ng?YMd2K}Glav)S~w)1s%TJ};&k+m+c*>^%pEU?jPr89eSu<N0i#dlgB(@eMWE;QY~+<$fGKhS#z2Vd?)Z_^4r-Hwaip5jn<v~gJHSzLMkdH#9+dH#9+dH#9+dH#9+dH#9+dH#9+dH#9+dH#9+dH#9+`4jy7e-f~=zyNRq00
+runcmd:
+- [/usr/bin/python3, -I, /usr/local/sbin/aef-bootstrap-v4.py, --bootstrap]
