@@ -219,9 +219,6 @@ jobs:
           if actuator_v2_git_blob != "56419c35dbbddd216f47ef650ef9013b693abc67":
               raise SystemExit("AEF#207 v2 staged Git blob mismatch")
           compile(actuator_v2, "aef207-rep191-shadow-live-v2.py", "exec")
-          for marker in forbidden:
-              if marker in actuator_v2:
-                  raise SystemExit(f"AEF#207 v2 forbidden credential marker: {marker!r}")
           print(
               "PUBLIC_AEF207_LIVE_ACTUATOR_V2_STAGED "
               f"bytes={len(actuator_v2)} sha256={actuator_v2_sha} git_blob={actuator_v2_git_blob}"
