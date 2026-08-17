@@ -9,9 +9,28 @@ Activation task:
 https://github.com/sevranty/agent-execution-fabric/issues/61
 
 Current publication task:
-https://github.com/sevranty/aef-bootstrap-public/issues/9
+https://github.com/sevranty/aef-bootstrap-public/issues/11
 
-## Current AEF#207 one-shot SHADOW actuator
+## Current AEF#207 diagnostic-safe SHADOW v2 actuator
+
+Source task:
+https://github.com/sevranty/agent-execution-fabric/issues/207
+
+Source AEF merge:
+64ace61fa87b9b6ade958e3a0da63bea826085af
+
+Source full validation run:
+32048390857
+
+Published files:
+- `aef207-rep191-shadow-live-v2.py` - byte-identical to private source Git blob `56419c35dbbddd216f47ef650ef9013b693abc67`, 34182 bytes, SHA-256 `b64e04f9180adb87285981a76758e91978d14a4cbeb51b7f8773551206324a3a`;
+- `aef207-rep191-shadow-live-v2-manifest.json` - secret-free source/distribution identity with `protected_retry_authorized=false`.
+
+The v2 actuator is prepared for decision `AEF61-REP191-PROTECTED-SHADOW-V2`, but publication does not authorize or perform a protected retry. It preserves the immutable v1 evidence, validates the already-materialized local release/state read-only, keeps a bounded sanitized child failure cause, executes the child at most once only after a separate explicit authorization, and has no ACTIVE mode, remote dispatch, scheduler cutover, provider mutation, source mutation or credential-value output path.
+
+Only an immutable raw URL containing the factual public merge SHA may be used for any later owner-authorized invocation. A mutable `main` or task-branch URL is forbidden.
+
+## Historical AEF#207 one-shot SHADOW v1 actuator
 
 Source task:
 https://github.com/sevranty/agent-execution-fabric/issues/207
@@ -23,10 +42,10 @@ Source full validation run:
 32014300126
 
 Published files:
-- `aef207-rep191-shadow-live.py` — byte-identical to private source Git blob `4a05e0be9632c7f726b6ad3080f4e1bb16606e88`, SHA-256 `489d44e8d1861b123b21e87baf2377e26d62ca2909fb4fed33722661295a6845`;
-- `aef207-rep191-shadow-live-manifest.json` — secret-free source/distribution identity.
+- `aef207-rep191-shadow-live.py` - byte-identical to private source Git blob `4a05e0be9632c7f726b6ad3080f4e1bb16606e88`, SHA-256 `489d44e8d1861b123b21e87baf2377e26d62ca2909fb4fed33722661295a6845`;
+- `aef207-rep191-shadow-live-manifest.json` - secret-free source/distribution identity.
 
-The actuator exists only for the explicitly authorized AEF#61 decision `AEF61-REP191-PROTECTED-SHADOW-V1`:
+The v1 actuator exists only for the explicitly authorized historical AEF#61 decision `AEF61-REP191-PROTECTED-SHADOW-V1`:
 - target worker is exactly `digitalocean:592813728`;
 - owner interaction is one checksum-pinned invocation plus one GitHub browser-auth flow if auth is absent;
 - source staging uses GitHub contents API `GET` only;
@@ -37,7 +56,7 @@ The actuator exists only for the explicitly authorized AEF#61 decision `AEF61-RE
 - remote dispatch, hourly scheduling, owner-local scheduler cutover, higher generation/fence, DigitalOcean changes and REPORT/source mutation are unavailable;
 - the process stops after terminal SHADOW evidence.
 
-Only an immutable raw URL containing the factual public merge SHA may be used. A mutable `main` or task-branch URL is forbidden for the owner invocation.
+The v1 publication is retained as immutable historical evidence and is not authorization to retry it.
 
 ## Current bootstrap v5
 
@@ -131,7 +150,9 @@ Bootstrap v3 incorporated canonical Ubuntu 24.04 provider parity and exact no-te
 - no private AEF source-tree mirror beyond explicitly approved exact secret-free distribution artifacts
 - immutable commit URLs are required for DigitalOcean bootstrap and protected pre-auth activation helpers
 - mutable branch URLs must not be used for worker creation or live owner invocation
-- public validation pins v3, v4, v5 and the current AEF#207 live actuator identities
+- public validation pins bootstrap v3, v4, v5 and AEF#207 SHADOW actuator v1 + v2 identities
+- public validation pins v2 byte count, SHA-256, Git blob, manifest contract and `protected_retry_authorized=false`
+- public validation checks forbidden credential markers across both AEF#207 actuator generations
 - public validation also pins the v5 GitHub CLI asset identity and capability contract
 
 DigitalOcean must use only the exact immutable raw URL produced after the relevant publication Pull Request is merged. Do not use a URL containing `main` or another mutable branch name.
