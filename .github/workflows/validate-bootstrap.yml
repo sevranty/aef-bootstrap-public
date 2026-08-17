@@ -11,6 +11,8 @@ on:
       - aef-worker-v4-manifest.json
       - aef-worker-v5.yaml
       - aef-worker-v5-manifest.json
+      - aef207-rep191-shadow-live.py
+      - aef207-rep191-shadow-live-manifest.json
       - README.md
       - .github/workflows/validate-bootstrap.yml
   push:
@@ -23,6 +25,8 @@ on:
       - aef-worker-v4-manifest.json
       - aef-worker-v5.yaml
       - aef-worker-v5-manifest.json
+      - aef207-rep191-shadow-live.py
+      - aef207-rep191-shadow-live-manifest.json
       - README.md
       - .github/workflows/validate-bootstrap.yml
 
@@ -161,5 +165,44 @@ jobs:
                   "manifest_bytes": 1429,
                   "manifest_sha256": "8a91db7a84d9417821dc906b8a00e8c3411c6953d1234618203011729e455a40",
               },
+          )
+
+          actuator_path = Path("aef207-rep191-shadow-live.py")
+          actuator = actuator_path.read_bytes()
+          actuator_manifest_bytes = Path("aef207-rep191-shadow-live-manifest.json").read_bytes()
+          actuator_manifest = json.loads(actuator_manifest_bytes.decode("ascii"))
+          expected_actuator = {
+              "schema_version": 1,
+              "task_id": "AEF-PUBLIC#9",
+              "parent_task_id": "AEF#207",
+              "decision_id": "AEF61-REP191-PROTECTED-SHADOW-V1",
+              "distribution_kind": "one-shot-shadow-live-actuator",
+              "source_repository": "https://github.com/sevranty/agent-execution-fabric",
+              "source_revision": "b93716bce237de73b46168c3c29d6e797a468dd7",
+              "source_path": "control/aef61_rep191_shadow_live.py",
+              "source_git_blob_sha": "4a05e0be9632c7f726b6ad3080f4e1bb16606e88",
+              "actuator_path": "aef207-rep191-shadow-live.py",
+              "actuator_sha256": "489d44e8d1861b123b21e87baf2377e26d62ca2909fb4fed33722661295a6845",
+              "target_worker_id": "digitalocean:592813728",
+              "credential_values_present": False,
+              "activation_performed": False,
+          }
+          if actuator_manifest != expected_actuator:
+              raise SystemExit("AEF#207 public actuator manifest contract mismatch")
+          actuator_sha = hashlib.sha256(actuator).hexdigest()
+          if actuator_sha != expected_actuator["actuator_sha256"]:
+              raise SystemExit("AEF#207 public actuator SHA-256 mismatch")
+          git_blob = hashlib.sha1(
+              b"blob " + str(len(actuator)).encode("ascii") + b"\0" + actuator
+          ).hexdigest()
+          if git_blob != expected_actuator["source_git_blob_sha"]:
+              raise SystemExit("AEF#207 public actuator Git blob mismatch")
+          compile(actuator, "aef207-rep191-shadow-live.py", "exec")
+          for marker in forbidden:
+              if marker in actuator or marker in actuator_manifest_bytes:
+                  raise SystemExit(f"AEF#207 forbidden credential marker: {marker!r}")
+          print(
+              "PUBLIC_AEF207_LIVE_ACTUATOR_PASS "
+              f"bytes={len(actuator)} sha256={actuator_sha} git_blob={git_blob}"
           )
           PY

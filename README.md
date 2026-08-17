@@ -1,6 +1,6 @@
 # AEF Bootstrap Public
 
-Public distribution repository for generated, secret-free Agent Execution Fabric bootstrap artifacts.
+Public distribution repository for generated, secret-free Agent Execution Fabric bootstrap artifacts and exact pre-auth activation helpers.
 
 Source of truth remains private:
 https://github.com/sevranty/agent-execution-fabric
@@ -9,7 +9,35 @@ Activation task:
 https://github.com/sevranty/agent-execution-fabric/issues/61
 
 Current publication task:
-https://github.com/sevranty/aef-bootstrap-public/issues/7
+https://github.com/sevranty/aef-bootstrap-public/issues/9
+
+## Current AEF#207 one-shot SHADOW actuator
+
+Source task:
+https://github.com/sevranty/agent-execution-fabric/issues/207
+
+Source AEF merge:
+b93716bce237de73b46168c3c29d6e797a468dd7
+
+Source full validation run:
+32014300126
+
+Published files:
+- `aef207-rep191-shadow-live.py` — byte-identical to private source Git blob `4a05e0be9632c7f726b6ad3080f4e1bb16606e88`, SHA-256 `489d44e8d1861b123b21e87baf2377e26d62ca2909fb4fed33722661295a6845`;
+- `aef207-rep191-shadow-live-manifest.json` — secret-free source/distribution identity.
+
+The actuator exists only for the explicitly authorized AEF#61 decision `AEF61-REP191-PROTECTED-SHADOW-V1`:
+- target worker is exactly `digitalocean:592813728`;
+- owner interaction is one checksum-pinned invocation plus one GitHub browser-auth flow if auth is absent;
+- source staging uses GitHub contents API `GET` only;
+- the exact REP#214 SHADOW bundle is verified before atomic publication;
+- one bounded worker enrollment record is materialized;
+- exactly one REP#191 `live-shadow` is executed;
+- terminal evidence must explicitly report `mutation_performed=false` and `github_mutation_performed=false`;
+- remote dispatch, hourly scheduling, owner-local scheduler cutover, higher generation/fence, DigitalOcean changes and REPORT/source mutation are unavailable;
+- the process stops after terminal SHADOW evidence.
+
+Only an immutable raw URL containing the factual public merge SHA may be used. A mutable `main` or task-branch URL is forbidden for the owner invocation.
 
 ## Current bootstrap v5
 
@@ -98,12 +126,12 @@ Bootstrap v3 incorporated canonical Ubuntu 24.04 provider parity and exact no-te
 
 ## Security boundary
 
-- generated bootstrap distribution only
+- generated/bootstrap/activation distribution only
 - no credentials, tokens, private keys, secrets, or private issue attachments
-- no private AEF source-tree mirror
-- immutable commit URLs are required for DigitalOcean bootstrap
-- mutable branch URLs must not be used for worker creation
-- public validation pins v3, v4 and current v5 byte counts and SHA-256 identities
+- no private AEF source-tree mirror beyond explicitly approved exact secret-free distribution artifacts
+- immutable commit URLs are required for DigitalOcean bootstrap and protected pre-auth activation helpers
+- mutable branch URLs must not be used for worker creation or live owner invocation
+- public validation pins v3, v4, v5 and the current AEF#207 live actuator identities
 - public validation also pins the v5 GitHub CLI asset identity and capability contract
 
-DigitalOcean must use only the exact immutable raw URL produced after the publication Pull Request is merged. Do not use a URL containing `main` or another mutable branch name.
+DigitalOcean must use only the exact immutable raw URL produced after the relevant publication Pull Request is merged. Do not use a URL containing `main` or another mutable branch name.
