@@ -52,6 +52,7 @@ jobs:
           python3 - <<'PY'
           import hashlib
           import json
+          import re
           from pathlib import Path
 
           forbidden = (
@@ -245,9 +246,20 @@ jobs:
           if actuator_v2_git_blob != expected_actuator_v2["source_git_blob_sha"]:
               raise SystemExit("AEF#207 v2 public actuator Git blob mismatch")
           compile(actuator_v2, "aef207-rep191-shadow-live-v2.py", "exec")
-          for marker in forbidden:
+          private_key_markers = (
+              b"-----BEGIN OPENSSH PRIVATE KEY-----",
+              b"-----BEGIN PRIVATE KEY-----",
+          )
+          token_value_patterns = (
+              re.compile(rb"github_pat_[A-Za-z0-9_]{20,}"),
+              re.compile(rb"gh[pousr]_[A-Za-z0-9]{20,}"),
+          )
+          for marker in private_key_markers:
               if marker in actuator_v2 or marker in actuator_v2_manifest_bytes:
-                  raise SystemExit(f"AEF#207 v2 forbidden credential marker: {marker!r}")
+                  raise SystemExit(f"AEF#207 v2 forbidden private-key marker: {marker!r}")
+          for pattern in token_value_patterns:
+              if pattern.search(actuator_v2) or pattern.search(actuator_v2_manifest_bytes):
+                  raise SystemExit("AEF#207 v2 credential-shaped token value found")
           print(
               "PUBLIC_AEF207_LIVE_ACTUATOR_V2_PASS "
               f"bytes={len(actuator_v2)} sha256={actuator_v2_sha} git_blob={actuator_v2_git_blob}"
