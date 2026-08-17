@@ -13,6 +13,8 @@ on:
       - aef-worker-v5-manifest.json
       - aef207-rep191-shadow-live.py
       - aef207-rep191-shadow-live-manifest.json
+      - aef207-rep191-shadow-live-v2.py
+      - aef207-rep191-shadow-live-v2-manifest.json
       - README.md
       - .github/workflows/validate-bootstrap.yml
   push:
@@ -27,6 +29,8 @@ on:
       - aef-worker-v5-manifest.json
       - aef207-rep191-shadow-live.py
       - aef207-rep191-shadow-live-manifest.json
+      - aef207-rep191-shadow-live-v2.py
+      - aef207-rep191-shadow-live-v2-manifest.json
       - README.md
       - .github/workflows/validate-bootstrap.yml
 
@@ -204,5 +208,22 @@ jobs:
           print(
               "PUBLIC_AEF207_LIVE_ACTUATOR_PASS "
               f"bytes={len(actuator)} sha256={actuator_sha} git_blob={git_blob}"
+          )
+
+          actuator_v2_path = Path("aef207-rep191-shadow-live-v2.py")
+          actuator_v2 = actuator_v2_path.read_bytes()
+          actuator_v2_sha = hashlib.sha256(actuator_v2).hexdigest()
+          actuator_v2_git_blob = hashlib.sha1(
+              b"blob " + str(len(actuator_v2)).encode("ascii") + b"\0" + actuator_v2
+          ).hexdigest()
+          if actuator_v2_git_blob != "56419c35dbbddd216f47ef650ef9013b693abc67":
+              raise SystemExit("AEF#207 v2 staged Git blob mismatch")
+          compile(actuator_v2, "aef207-rep191-shadow-live-v2.py", "exec")
+          for marker in forbidden:
+              if marker in actuator_v2:
+                  raise SystemExit(f"AEF#207 v2 forbidden credential marker: {marker!r}")
+          print(
+              "PUBLIC_AEF207_LIVE_ACTUATOR_V2_STAGED "
+              f"bytes={len(actuator_v2)} sha256={actuator_v2_sha} git_blob={actuator_v2_git_blob}"
           )
           PY
