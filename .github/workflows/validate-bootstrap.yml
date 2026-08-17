@@ -212,15 +212,44 @@ jobs:
 
           actuator_v2_path = Path("aef207-rep191-shadow-live-v2.py")
           actuator_v2 = actuator_v2_path.read_bytes()
+          actuator_v2_manifest_bytes = Path("aef207-rep191-shadow-live-v2-manifest.json").read_bytes()
+          actuator_v2_manifest = json.loads(actuator_v2_manifest_bytes.decode("ascii"))
+          expected_actuator_v2 = {
+              "schema_version": 2,
+              "task_id": "AEF-PUBLIC#11",
+              "parent_task_id": "AEF#207",
+              "decision_id": "AEF61-REP191-PROTECTED-SHADOW-V2",
+              "distribution_kind": "diagnostic-safe-one-shot-shadow-live-actuator",
+              "source_repository": "https://github.com/sevranty/agent-execution-fabric",
+              "source_revision": "64ace61fa87b9b6ade958e3a0da63bea826085af",
+              "source_path": "control/aef61_rep191_shadow_live_v2.py",
+              "source_git_blob_sha": "56419c35dbbddd216f47ef650ef9013b693abc67",
+              "actuator_path": "aef207-rep191-shadow-live-v2.py",
+              "actuator_bytes": 34182,
+              "actuator_sha256": "b64e04f9180adb87285981a76758e91978d14a4cbeb51b7f8773551206324a3a",
+              "target_worker_id": "digitalocean:592813728",
+              "credential_values_present": False,
+              "activation_performed": False,
+              "protected_retry_authorized": False,
+          }
+          if actuator_v2_manifest != expected_actuator_v2:
+              raise SystemExit("AEF#207 v2 public actuator manifest contract mismatch")
           actuator_v2_sha = hashlib.sha256(actuator_v2).hexdigest()
+          if len(actuator_v2) != expected_actuator_v2["actuator_bytes"]:
+              raise SystemExit("AEF#207 v2 public actuator byte-count mismatch")
+          if actuator_v2_sha != expected_actuator_v2["actuator_sha256"]:
+              raise SystemExit("AEF#207 v2 public actuator SHA-256 mismatch")
           actuator_v2_git_blob = hashlib.sha1(
               b"blob " + str(len(actuator_v2)).encode("ascii") + b"\0" + actuator_v2
           ).hexdigest()
-          if actuator_v2_git_blob != "56419c35dbbddd216f47ef650ef9013b693abc67":
-              raise SystemExit("AEF#207 v2 staged Git blob mismatch")
+          if actuator_v2_git_blob != expected_actuator_v2["source_git_blob_sha"]:
+              raise SystemExit("AEF#207 v2 public actuator Git blob mismatch")
           compile(actuator_v2, "aef207-rep191-shadow-live-v2.py", "exec")
+          for marker in forbidden:
+              if marker in actuator_v2 or marker in actuator_v2_manifest_bytes:
+                  raise SystemExit(f"AEF#207 v2 forbidden credential marker: {marker!r}")
           print(
-              "PUBLIC_AEF207_LIVE_ACTUATOR_V2_STAGED "
+              "PUBLIC_AEF207_LIVE_ACTUATOR_V2_PASS "
               f"bytes={len(actuator_v2)} sha256={actuator_v2_sha} git_blob={actuator_v2_git_blob}"
           )
           PY
