@@ -1,0 +1,18 @@
+{
+  "schema_version": 2,
+  "task_id": "AEF-PUBLIC#11",
+  "parent_task_id": "AEF#207",
+  "decision_id": "AEF61-REP191-PROTECTED-SHADOW-V2",
+  "distribution_kind": "diagnostic-safe-one-shot-shadow-live-actuator",
+  "source_repository": "https://github.com/sevranty/agent-execution-fabric",
+  "source_revision": "64ace61fa87b9b6ade958e3a0da63bea826085af",
+  "source_path": "control/aef61_rep191_shadow_live_v2.py",
+  "source_git_blob_sha": "56419c35dbbddd216f47ef650ef9013b693abc67",
+  "actuator_path": "aef207-rep191-shadow-live-v2.py",
+  "actuator_bytes": 34182,
+  "actuator_sha256": "b64e04f9180adb87285981a76758e91978d14a4cbeb51b7f8773551206324a3a",
+  "target_worker_id": "digitalocean:592813728",
+  "credential_values_present": false,
+  "activation_performed": false,
+  "protected_retry_authorized": false
+}
