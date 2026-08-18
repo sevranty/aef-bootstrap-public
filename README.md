@@ -9,7 +9,40 @@ Activation task:
 https://github.com/sevranty/agent-execution-fabric/issues/61
 
 Current publication task:
-https://github.com/sevranty/aef-bootstrap-public/issues/11
+https://github.com/sevranty/aef-bootstrap-public/issues/13
+
+## Current canonical worker-v6 bootstrap for AEF#61
+
+Source task:
+https://github.com/sevranty/agent-execution-fabric/issues/61
+
+Publication task:
+https://github.com/sevranty/aef-bootstrap-public/issues/13
+
+Source AEF merge:
+`e3c9e0bb460639cf77ec69fb43769ade74a498a1`
+
+Published candidate files:
+- `aef-worker-v6.yaml` - 382387 bytes, SHA-256 `2d77df7875c7509b81a05d45b6c00357f199a05e5e9f47e78398a1af5a07c649`
+- `aef-worker-v6-manifest.json` - 1580 bytes, SHA-256 `43a020f8f34888b701c44380dcfd17dcb87572fb9cd3be83b162a98660063cb3`
+
+Pinned identities:
+- source inventory SHA-256 `2c85e3e59f394e87b19f385325f539b67e015f1d5914bc5ddbb0f0cf17ad3e4a`
+- source manifest SHA-256 `ecc91ce6ed6bd0eeabdcece769053d5e44c892cc2a2c2426757da275e0ac094d`
+- worker release content SHA-256 `1d9945489c033270e6346e3ac73af130ee1407ab6a6499b44d87efffc5ce4471`
+- path contract `path-contract-v2`
+- capability set `capability-set-v1`
+- GitHub CLI `2.97.0`, exact archive and binary checksums recorded in the manifest
+
+The v6 distribution is intentionally pre-authorization and pre-ACTIVE. It contains no credential values and performs no DigitalOcean provider mutation, remote dispatch, scheduler cutover or ACTIVE transition. Workload package installation is forbidden. GitHub CLI is installed declaratively before job admission.
+
+After a clean host completes bootstrap and all local readiness checks pass, the only prepared owner command is:
+
+`sudo aefctl --format json credentials github login --then-run report.rep191-lifeops-refresh.shadow`
+
+That command is not authorization to run it. AEF#61 requires a separate owner decision before creation of a new DigitalOcean Droplet. After creation, the browser-auth command may execute exactly one prepared REP#191 SHADOW and must stop before ACTIVE or scheduler cutover.
+
+Only an immutable raw URL containing the factual public merge SHA may be used for DigitalOcean bootstrap. A mutable `main` or task-branch URL is forbidden.
 
 ## Current AEF#207 diagnostic-safe SHADOW v2 actuator
 
@@ -44,17 +77,6 @@ Source full validation run:
 Published files:
 - `aef207-rep191-shadow-live.py` - byte-identical to private source Git blob `4a05e0be9632c7f726b6ad3080f4e1bb16606e88`, SHA-256 `489d44e8d1861b123b21e87baf2377e26d62ca2909fb4fed33722661295a6845`;
 - `aef207-rep191-shadow-live-manifest.json` - secret-free source/distribution identity.
-
-The v1 actuator exists only for the explicitly authorized historical AEF#61 decision `AEF61-REP191-PROTECTED-SHADOW-V1`:
-- target worker is exactly `digitalocean:592813728`;
-- owner interaction is one checksum-pinned invocation plus one GitHub browser-auth flow if auth is absent;
-- source staging uses GitHub contents API `GET` only;
-- the exact REP#214 SHADOW bundle is verified before atomic publication;
-- one bounded worker enrollment record is materialized;
-- exactly one REP#191 `live-shadow` is executed;
-- terminal evidence must explicitly report `mutation_performed=false` and `github_mutation_performed=false`;
-- remote dispatch, hourly scheduling, owner-local scheduler cutover, higher generation/fence, DigitalOcean changes and REPORT/source mutation are unavailable;
-- the process stops after terminal SHADOW evidence.
 
 The v1 publication is retained as immutable historical evidence and is not authorization to retry it.
 
@@ -150,9 +172,8 @@ Bootstrap v3 incorporated canonical Ubuntu 24.04 provider parity and exact no-te
 - no private AEF source-tree mirror beyond explicitly approved exact secret-free distribution artifacts
 - immutable commit URLs are required for DigitalOcean bootstrap and protected pre-auth activation helpers
 - mutable branch URLs must not be used for worker creation or live owner invocation
-- public validation pins bootstrap v3, v4, v5 and AEF#207 SHADOW actuator v1 + v2 identities
-- public validation pins v2 byte count, SHA-256, Git blob, manifest contract and `protected_retry_authorized=false`
-- public validation checks forbidden credential markers across both AEF#207 actuator generations
-- public validation also pins the v5 GitHub CLI asset identity and capability contract
+- public validation pins bootstrap v3, v4, v5, worker v6 and AEF#207 SHADOW actuator v1 + v2 identities
+- public validation pins worker-v6 byte count, SHA-256, manifest, source revision, source inventory, release checksum and negative safety flags
+- public validation checks forbidden credential markers in published bootstrap and actuator artifacts
 
 DigitalOcean must use only the exact immutable raw URL produced after the relevant publication Pull Request is merged. Do not use a URL containing `main` or another mutable branch name.
