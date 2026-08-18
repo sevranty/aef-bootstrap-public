@@ -97,14 +97,60 @@ jobs:
           for name, payload in ((artifact_path.name, artifact), (manifest_path.name, manifest_bytes)):
               for pattern in forbidden:
                   assert pattern.search(payload) is None, (name, pattern.pattern)
+          PY
 
-          print(json.dumps({
-              'status': 'PASS',
-              'artifact_sha256': hashlib.sha256(artifact).hexdigest(),
-              'manifest_sha256': hashlib.sha256(manifest_bytes).hexdigest(),
-              'source_revision': manifest['source_revision'],
-              'protected_actions_performed': False,
-          }, sort_keys=True))
+      - name: Reconstruct clean worker from public artifact only
+        env:
+          PUBLIC_ROOT: ${{ runner.temp }}/aef-public-worker-v6
+          SOURCE_REVISION: e3c9e0bb460639cf77ec69fb43769ade74a498a1
+        run: |
+          rm -rf "$PUBLIC_ROOT"
+          mkdir -p "$PUBLIC_ROOT"
+          python3 - <<'PY'
+          import base64
+          import os
+          from pathlib import Path
+          import yaml
+
+          root = Path(os.environ['PUBLIC_ROOT'])
+          config = yaml.safe_load(Path('aef-worker-v6.yaml').read_text(encoding='utf-8'))
+          assert isinstance(config, dict)
+          assert config.get('package_update') is False
+          assert config.get('package_upgrade') is False
+          records = config.get('write_files')
+          assert isinstance(records, list) and records
+          for record in records:
+              canonical = Path(record['path'])
+              assert canonical.is_absolute()
+              target = root / canonical.relative_to('/')
+              target.parent.mkdir(parents=True, exist_ok=True)
+              raw = str(record['content']).encode('ascii')
+              payload = base64.b64decode(raw, validate=True) if record.get('encoding') == 'b64' else raw
+              target.write_bytes(payload)
+              target.chmod(int(str(record.get('permissions', '0644')), 8))
+          PY
+          /usr/bin/python3 -I -B \
+            "$PUBLIC_ROOT/opt/aef/bootstrap-source-v6/bootstrap/aef_worker_v6_firstboot.py" \
+            --repository-root "$PUBLIC_ROOT/opt/aef/bootstrap-source-v6" \
+            --source-manifest "$PUBLIC_ROOT/etc/aef/bootstrap-source-v6.json" \
+            --source-revision "$SOURCE_REVISION" \
+            --root "$PUBLIC_ROOT" \
+            --worker-id public-ci-worker-v6 \
+            --synthetic > "$PUBLIC_ROOT/result.json"
+          PUBLIC_ROOT="$PUBLIC_ROOT" python3 - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+          value = json.loads((Path(os.environ['PUBLIC_ROOT']) / 'result.json').read_text())
+          assert value['status'] == 'PASS', value
+          assert value['code'] == 'WORKER_V6_FIRSTBOOT_PASS', value
+          assert value['reconstruction']['health']['state'] == 'READY', value
+          assert value['credential_values_present'] is False, value
+          assert value['remote_dispatch'] is False, value
+          assert value['scheduler_cutover'] is False, value
+          assert value['active_mode'] is False, value
+          assert value['protected_actions'] is False, value
+          print(json.dumps({'status': 'PASS', 'code': value['code'], 'state': 'READY'}, sort_keys=True))
           PY
 
       - name: Verify Git tree modes
