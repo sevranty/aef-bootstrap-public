@@ -25,6 +25,7 @@ Source AEF merge:
 Current distribution files:
 - `aef-worker-v6.yaml` - 382623 bytes, SHA-256 `99d41126f1499e376260c126be3b5807f7d99be1765a2145c28fd3ced179f6cf`
 - `aef-worker-v6-manifest.json` - 1580 bytes, SHA-256 `45778b919d5aa1cece200580d313495eac5332a4a8221ede85de23ccc524850a`
+- `aef-worker-v6-digitalocean-user-data.txt` - 132 bytes, SHA-256 `f44e2f93dd292bd75961ecfa5e005b8ee6fd3a4918c66a6cd0d1d3651c2b24a5`
 
 Pinned identities:
 - source inventory SHA-256 `4c2d54c3c2a4e042965264ed5c0bf130e6296935c7ade9247b3aed9824fefcaa`
@@ -52,15 +53,28 @@ After a future clean host completes bootstrap and all local readiness checks pas
 
 That command is not authorization to run it. The browser-auth command may execute exactly one prepared REP#191 SHADOW and must stop before ACTIVE or scheduler cutover.
 
-### DigitalOcean user-data transport: temporarily unavailable pending immutable repin
+### DigitalOcean user-data transport
 
 The canonical cloud-config is larger than the DigitalOcean plain-text `user_data` limit, so it must not be pasted directly into the Droplet creation form.
 
-The previous `aef-worker-v6-digitalocean-user-data.txt` pointed to the superseded worker-v6 artifact and has therefore been removed fail-closed in this publication stage.
+Use only `aef-worker-v6-digitalocean-user-data.txt` as the Startup Script for the next separately authorized clean AEF worker. It contains exactly two physical lines and no terminal newline:
 
-**Do not create a new AEF worker from the current intermediate public state.** AEF-PUBLIC#13 requires a second publication step after this corrected artifact is merged. That step will recreate the 132-byte cloud-init `#include` using the factual immutable public merge SHA of this corrected `aef-worker-v6.yaml`, validate network readback and then expose the next canonical DigitalOcean provider payload.
+```text
+#include
+https://raw.githubusercontent.com/sevranty/aef-bootstrap-public/d613cf39c8c967e618098d0f964a6ac515beee4a/aef-worker-v6.yaml
+```
 
-A mutable `main` or task-branch URL remains forbidden.
+Exact transport identity:
+- payload bytes: 132
+- payload SHA-256: `f44e2f93dd292bd75961ecfa5e005b8ee6fd3a4918c66a6cd0d1d3651c2b24a5`
+- terminal newline: false
+- immutable target merge: `d613cf39c8c967e618098d0f964a6ac515beee4a`
+- target bytes: 382623
+- target SHA-256: `99d41126f1499e376260c126be3b5807f7d99be1765a2145c28fd3ced179f6cf`
+
+The transport validator performs a network readback of that immutable target and requires byte-for-byte equality with the canonical public YAML. A mutable `main` or task-branch URL is forbidden.
+
+`aef-worker-06` remains failed clean-host evidence and must not be repaired or reused for acceptance. The next clean acceptance host is `aef-worker-07` only after a separate explicit owner authorization in AEF#61.
 
 ## Current AEF#207 diagnostic-safe SHADOW v2 actuator
 
@@ -207,7 +221,7 @@ Bootstrap v3 incorporated canonical Ubuntu 24.04 provider parity and exact no-te
 - public validation also pins the v5 GitHub CLI asset identity and capability contract
 - public validation pins corrected worker-v6 byte count, SHA-256, manifest, source revision, source inventory, release checksum and negative safety flags
 - public validation requires auto-derived worker-v6 identity on public-only clean reconstruction
-- provider payload is deliberately absent until a factual immutable public merge SHA is available for repin
+- public validation pins the 132-byte DigitalOcean provider payload to immutable corrected worker-v6 merge `d613cf39c8c967e618098d0f964a6ac515beee4a` and validates target network readback
 - public validation checks forbidden credential markers in published bootstrap and actuator artifacts
 
-DigitalOcean creation for the next AEF#61 clean host remains blocked until AEF-PUBLIC#13 recreates and validates the immutable `aef-worker-v6-digitalocean-user-data.txt` payload in the second publication stage.
+The public distribution is ready for a separately owner-authorized new clean AEF#61 acceptance host. Publication itself does not authorize DigitalOcean creation, browser authentication, REP#191 SHADOW, remote dispatch, scheduler cutover or ACTIVE.
