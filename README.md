@@ -25,6 +25,7 @@ Source AEF merge:
 Published candidate files:
 - `aef-worker-v6.yaml` - 382387 bytes, SHA-256 `2d77df7875c7509b81a05d45b6c00357f199a05e5e9f47e78398a1af5a07c649`
 - `aef-worker-v6-manifest.json` - 1580 bytes, SHA-256 `43a020f8f34888b701c44380dcfd17dcb87572fb9cd3be83b162a98660063cb3`
+- `aef-worker-v6-digitalocean-user-data.txt` - 132 bytes, SHA-256 `7548f8385f228d6125306a0b3c54d49376a34e68f20ba01febed98a655126a13`
 
 Pinned identities:
 - source inventory SHA-256 `2c85e3e59f394e87b19f385325f539b67e015f1d5914bc5ddbb0f0cf17ad3e4a`
@@ -42,7 +43,24 @@ After a clean host completes bootstrap and all local readiness checks pass, the 
 
 That command is not authorization to run it. AEF#61 requires a separate owner decision before creation of a new DigitalOcean Droplet. After creation, the browser-auth command may execute exactly one prepared REP#191 SHADOW and must stop before ACTIVE or scheduler cutover.
 
-Only an immutable raw URL containing the factual public merge SHA may be used for DigitalOcean bootstrap. A mutable `main` or task-branch URL is forbidden.
+### DigitalOcean user-data transport
+
+The canonical cloud-config is larger than the DigitalOcean plain-text `user_data` limit, so it must not be pasted directly into the Droplet creation form.
+
+Use only `aef-worker-v6-digitalocean-user-data.txt` as the DigitalOcean Startup script. It is a cloud-init `#include` payload and points to the canonical cloud-config in immutable public merge `aad3ad6f7eb960d5e33bb550d29e6bcbfb26e1fc`.
+
+The transport contract is deliberately narrow:
+- exact payload size: 132 bytes
+- exact payload SHA-256: `7548f8385f228d6125306a0b3c54d49376a34e68f20ba01febed98a655126a13`
+- no trailing newline
+- HTTPS only
+- `raw.githubusercontent.com` only
+- exact repository `sevranty/aef-bootstrap-public`
+- exact 40-hex immutable commit
+- exact target file `aef-worker-v6.yaml`
+- target readback must be 382387 bytes with SHA-256 `2d77df7875c7509b81a05d45b6c00357f199a05e5e9f47e78398a1af5a07c649`
+
+A mutable `main` or task-branch URL is forbidden.
 
 ## Current AEF#207 diagnostic-safe SHADOW v2 actuator
 
@@ -158,6 +176,9 @@ Bootstrap v4 established root-mode clean-host acceptance, bytecode-free runtime 
 Publication task:
 https://github.com/sevranty/aef-bootstrap-public/issues/3
 
+Source task:
+https://github.com/sevranty/agent-execution-fabric/issues/150
+
 Source AEF merge:
 b36dfe677d446d77d093ec9975aaca75515c613d
 
@@ -188,6 +209,7 @@ Bootstrap v3 incorporated canonical Ubuntu 24.04 provider parity and exact no-te
 - public validation checks forbidden credential markers across both AEF#207 actuator generations
 - public validation also pins the v5 GitHub CLI asset identity and capability contract
 - public validation pins worker-v6 byte count, SHA-256, manifest, source revision, source inventory, release checksum and negative safety flags
+- public validation pins the DigitalOcean user-data include payload and its immutable target readback
 - public validation checks forbidden credential markers in published bootstrap and actuator artifacts
 
-DigitalOcean must use only the exact immutable raw URL produced after the relevant publication Pull Request is merged. Do not use a URL containing `main` or another mutable branch name.
+DigitalOcean must use only the exact `aef-worker-v6-digitalocean-user-data.txt` payload for AEF#61 creation. The referenced target is immutable and checksum-pinned. Do not use a URL containing `main` or another mutable branch name.
