@@ -1,0 +1,151 @@
+name: Assemble AEF61 worker-v6 staging
+
+on:
+  push:
+    branches:
+      - aef-public-13-upload-staging
+    paths:
+      - .publication-staging/READY
+
+permissions:
+  contents: write
+
+jobs:
+  assemble:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: Checkout staging branch
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+
+      - name: Rebind exact AEF merged source and assemble v6
+        env:
+          SOURCE_URL: https://sdmntpritalynorth.oaiusercontent.com/files/00000000-f700-8246-adf9-e7f088052059/raw?se=2026-08-18T08%3A15%3A42Z&sp=r&sv=2026-02-06&sr=b&scid=95715c8d-985e-543d-833e-1210da8fae6a&skoid=82a3371f-2f6c-4f81-8a78-2701b362559b&sktid=a48cca56-e6da-484e-a814-9c849652bcb3&skt=2026-08-18T06%3A01%3A05Z&ske=2026-08-19T06%3A01%3A05Z&sks=b&skv=2026-02-06&sig=I4nUSynzOmBVTFpt7vCE5O54NwpW%2BrEE8vpBwlGf/m0%3D
+          FINAL_SOURCE_REVISION: e3c9e0bb460639cf77ec69fb43769ade74a498a1
+          EXPECTED_YAML_BYTES: '382387'
+          EXPECTED_YAML_SHA256: 2d77df7875c7509b81a05d45b6c00357f199a05e5e9f47e78398a1af5a07c649
+          EXPECTED_SOURCE_INVENTORY_SHA256: 2c85e3e59f394e87b19f385325f539b67e015f1d5914bc5ddbb0f0cf17ad3e4a
+          EXPECTED_SOURCE_MANIFEST_SHA256: ecc91ce6ed6bd0eeabdcece769053d5e44c892cc2a2c2426757da275e0ac094d
+          EXPECTED_MANIFEST_SHA256: 43a020f8f34888b701c44380dcfd17dcb87572fb9cd3be83b162a98660063cb3
+        run: |
+          python3 - <<'PY'
+          import base64
+          import hashlib
+          import json
+          import os
+          from pathlib import Path
+          import urllib.request
+          import zipfile
+
+          def canonical(value):
+              return (json.dumps(value, ensure_ascii=True, separators=(',', ':'), sort_keys=True, allow_nan=False) + '\n').encode('ascii')
+
+          source_url = os.environ['SOURCE_URL']
+          final_revision = os.environ['FINAL_SOURCE_REVISION']
+          archive = Path('/tmp/aef61-v6.zip')
+          request = urllib.request.Request(source_url, headers={'User-Agent': 'aef-public-v6-staging'})
+          with urllib.request.urlopen(request, timeout=60) as response:
+              archive.write_bytes(response.read())
+
+          with zipfile.ZipFile(archive) as bundle:
+              old_yaml = bundle.read('aef-worker-v6.yaml').decode('ascii')
+
+          prefix = '  - path: /opt/aef/bootstrap-source-v6/'
+          lines = old_yaml.splitlines()
+          source_bytes = {}
+          for index, line in enumerate(lines):
+              if not line.startswith(prefix):
+                  continue
+              relative = line[len(prefix):]
+              if index + 4 >= len(lines) or not lines[index + 4].startswith('    content: '):
+                  raise SystemExit(f'bad source record: {relative}')
+              data = base64.b64decode(lines[index + 4][len('    content: '):], validate=True)
+              source_bytes[relative] = data
+
+          if len(source_bytes) != 53:
+              raise SystemExit(f'source file count mismatch: {len(source_bytes)}')
+
+          records = [
+              {
+                  'path': path,
+                  'bytes': len(source_bytes[path]),
+                  'sha256': hashlib.sha256(source_bytes[path]).hexdigest(),
+                  'mode': '0444',
+              }
+              for path in sorted(source_bytes)
+          ]
+          unsigned = {
+              'schema_version': 1,
+              'task_id': 'AEF#61',
+              'source_revision': final_revision,
+              'files': records,
+          }
+          inventory_sha = hashlib.sha256(canonical(unsigned)).hexdigest()
+          if inventory_sha != os.environ['EXPECTED_SOURCE_INVENTORY_SHA256']:
+              raise SystemExit(f'source inventory mismatch: {inventory_sha}')
+          source_manifest = {**unsigned, 'inventory_sha256': inventory_sha}
+          source_manifest_bytes = canonical(source_manifest)
+          source_manifest_sha = hashlib.sha256(source_manifest_bytes).hexdigest()
+          if source_manifest_sha != os.environ['EXPECTED_SOURCE_MANIFEST_SHA256']:
+              raise SystemExit(f'source manifest mismatch: {source_manifest_sha}')
+
+          output = [
+              '#cloud-config',
+              'package_update: false',
+              'package_upgrade: false',
+              'write_files:',
+          ]
+          for record in records:
+              relative = record['path']
+              output.extend([
+                  f'  - path: /opt/aef/bootstrap-source-v6/{relative}',
+                  '    owner: root:root',
+                  "    permissions: '0444'",
+                  '    encoding: b64',
+                  f"    content: {base64.b64encode(source_bytes[relative]).decode('ascii')}",
+              ])
+          output.extend([
+              '  - path: /etc/aef/bootstrap-source-v6.json',
+              '    owner: root:root',
+              "    permissions: '0444'",
+              '    encoding: b64',
+              f"    content: {base64.b64encode(source_manifest_bytes).decode('ascii')}",
+              'runcmd:',
+              '  - ' + json.dumps([
+                  '/usr/bin/python3', '-I', '-B',
+                  '/opt/aef/bootstrap-source-v6/bootstrap/aef_worker_v6_firstboot.py',
+                  '--repository-root', '/opt/aef/bootstrap-source-v6',
+                  '--source-manifest', '/etc/aef/bootstrap-source-v6.json',
+                  '--source-revision', final_revision,
+              ], separators=(',', ':')),
+          ])
+          cloud = ('\n'.join(output) + '\n').encode('ascii')
+          actual_sha = hashlib.sha256(cloud).hexdigest()
+          if len(cloud) != int(os.environ['EXPECTED_YAML_BYTES']) or actual_sha != os.environ['EXPECTED_YAML_SHA256']:
+              raise SystemExit(f'cloud-config identity mismatch bytes={len(cloud)} sha={actual_sha}')
+
+          manifest_bytes = Path('aef-worker-v6-manifest.json').read_bytes()
+          if hashlib.sha256(manifest_bytes).hexdigest() != os.environ['EXPECTED_MANIFEST_SHA256']:
+              raise SystemExit('manifest identity mismatch')
+          manifest = json.loads(manifest_bytes.decode('ascii'))
+          if manifest['source_revision'] != final_revision or manifest['artifact_sha256'] != actual_sha:
+              raise SystemExit('manifest source/artifact binding mismatch')
+          if any(manifest[key] is not False for key in ('credential_values_present', 'remote_dispatch', 'scheduler_cutover', 'active_mode', 'protected_actions_performed')):
+              raise SystemExit('protected safety flag mismatch')
+
+          Path('aef-worker-v6.yaml').write_bytes(cloud)
+          print(f'AEF_PUBLIC_V6_ASSEMBLY_PASS bytes={len(cloud)} sha256={actual_sha}')
+          PY
+
+      - name: Commit only assembled artifact on staging branch
+        run: |
+          test "$(git branch --show-current)" = "aef-public-13-upload-staging"
+          git status --short
+          test -f aef-worker-v6.yaml
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -- aef-worker-v6.yaml
+          git commit -m "AEF-PUBLIC#13 assemble exact worker-v6 artifact"
+          git push origin HEAD:aef-public-13-upload-staging
