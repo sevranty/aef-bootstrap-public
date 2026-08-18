@@ -102,9 +102,35 @@ jobs:
           print(json.dumps({'status': 'PASS', 'source_revision': manifest['source_revision'], 'artifact_sha256': manifest['artifact_sha256']}, sort_keys=True))
           PY
 
-      - name: Require provider payload to stay absent until immutable repin
+      - name: Verify DigitalOcean immutable include transport
         run: |
-          test ! -e aef-worker-v6-digitalocean-user-data.txt
+          python3 - <<'PY'
+          import hashlib
+          import re
+          import urllib.request
+          from pathlib import Path
+
+          path = Path('aef-worker-v6-digitalocean-user-data.txt')
+          payload = path.read_bytes()
+          expected_url = 'https://raw.githubusercontent.com/sevranty/aef-bootstrap-public/d613cf39c8c967e618098d0f964a6ac515beee4a/aef-worker-v6.yaml'
+          expected_payload = ('#include\n' + expected_url).encode('ascii')
+          assert payload == expected_payload
+          assert len(payload) == 132
+          assert len(payload) <= 512
+          assert len(payload) <= 64 * 1024
+          assert hashlib.sha256(payload).hexdigest() == 'f44e2f93dd292bd75961ecfa5e005b8ee6fd3a4918c66a6cd0d1d3651c2b24a5'
+          assert not payload.endswith(b'\n')
+          assert re.fullmatch(rb'#include\nhttps://raw\.githubusercontent\.com/sevranty/aef-bootstrap-public/[0-9a-f]{40}/aef-worker-v6\.yaml', payload)
+
+          request = urllib.request.Request(expected_url, headers={'User-Agent': 'aef-public-v6-validator'})
+          with urllib.request.urlopen(request, timeout=30) as response:
+              target = response.read(382624)
+          assert len(target) == 382623
+          assert target.startswith(b'#cloud-config\n')
+          assert hashlib.sha256(target).hexdigest() == '99d41126f1499e376260c126be3b5807f7d99be1765a2145c28fd3ced179f6cf'
+          assert target == Path('aef-worker-v6.yaml').read_bytes()
+          print('DigitalOcean immutable include transport: PASS')
+          PY
 
       - name: Reconstruct clean worker from public artifact only with auto-derived identity
         env:
@@ -171,3 +197,4 @@ jobs:
         run: |
           test "$(git ls-files -s aef-worker-v6.yaml | awk '{print $1}')" = "100644"
           test "$(git ls-files -s aef-worker-v6-manifest.json | awk '{print $1}')" = "100644"
+          test "$(git ls-files -s aef-worker-v6-digitalocean-user-data.txt | awk '{print $1}')" = "100644"
