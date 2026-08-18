@@ -6,6 +6,7 @@ on:
     paths:
       - aef-worker-v6.yaml
       - aef-worker-v6-manifest.json
+      - aef-worker-v6-digitalocean-user-data.txt
       - README.md
       - .github/workflows/validate-worker-v6.yml
   push:
@@ -13,6 +14,7 @@ on:
     paths:
       - aef-worker-v6.yaml
       - aef-worker-v6-manifest.json
+      - aef-worker-v6-digitalocean-user-data.txt
       - README.md
       - .github/workflows/validate-worker-v6.yml
 
@@ -99,6 +101,35 @@ jobs:
                   assert pattern.search(payload) is None, (name, pattern.pattern)
           PY
 
+      - name: Verify DigitalOcean immutable include transport
+        run: |
+          python3 - <<'PY'
+          import hashlib
+          import re
+          import urllib.request
+          from pathlib import Path
+
+          path = Path('aef-worker-v6-digitalocean-user-data.txt')
+          payload = path.read_bytes()
+          expected_url = 'https://raw.githubusercontent.com/sevranty/aef-bootstrap-public/aad3ad6f7eb960d5e33bb550d29e6bcbfb26e1fc/aef-worker-v6.yaml'
+          expected_payload = ('#include\n' + expected_url).encode('ascii')
+          assert payload == expected_payload
+          assert len(payload) == 132
+          assert len(payload) <= 512
+          assert len(payload) <= 64 * 1024
+          assert hashlib.sha256(payload).hexdigest() == '7548f8385f228d6125306a0b3c54d49376a34e68f20ba01febed98a655126a13'
+          assert not payload.endswith(b'\n')
+          assert re.fullmatch(rb'#include\nhttps://raw\.githubusercontent\.com/sevranty/aef-bootstrap-public/[0-9a-f]{40}/aef-worker-v6\.yaml', payload)
+
+          request = urllib.request.Request(expected_url, headers={'User-Agent': 'aef-public-v6-validator'})
+          with urllib.request.urlopen(request, timeout=30) as response:
+              target = response.read(382388)
+          assert len(target) == 382387
+          assert target.startswith(b'#cloud-config\n')
+          assert hashlib.sha256(target).hexdigest() == '2d77df7875c7509b81a05d45b6c00357f199a05e5e9f47e78398a1af5a07c649'
+          assert target == Path('aef-worker-v6.yaml').read_bytes()
+          PY
+
       - name: Reconstruct clean worker from public artifact only
         env:
           PUBLIC_ROOT: ${{ runner.temp }}/aef-public-worker-v6
@@ -157,3 +188,4 @@ jobs:
         run: |
           test "$(git ls-files -s aef-worker-v6.yaml | awk '{print $1}')" = "100644"
           test "$(git ls-files -s aef-worker-v6-manifest.json | awk '{print $1}')" = "100644"
+          test "$(git ls-files -s aef-worker-v6-digitalocean-user-data.txt | awk '{print $1}')" = "100644"
