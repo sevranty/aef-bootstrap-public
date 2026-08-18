@@ -1,0 +1,156 @@
+name: AEF13 v6 republish staging
+
+on:
+  push:
+    branches:
+      - aef-public-13-v6-republish-staging
+    paths:
+      - .staging/aef-public-13/inline_user_data_v6.py
+      - .github/workflows/aef13-v6-republish-staging.yml
+
+permissions:
+  contents: write
+
+concurrency:
+  group: aef-public-13-v6-republish-staging
+  cancel-in-progress: true
+
+jobs:
+  rebuild-and-push:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - name: Checkout staging revision
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: true
+          fetch-depth: 0
+
+      - name: Rebuild exact resulting-main worker v6
+        run: |
+          python3 - <<'PY'
+          import base64
+          import hashlib
+          import json
+          from pathlib import Path
+          import shutil
+          import subprocess
+          import yaml
+
+          SOURCE_REVISION = '5966c258c4f90e0eb823282d080e84c37b895471'
+          EXPECTED = {
+              'artifact_bytes': 382623,
+              'artifact_sha256': '99d41126f1499e376260c126be3b5807f7d99be1765a2145c28fd3ced179f6cf',
+              'manifest_sha256': '45778b919d5aa1cece200580d313495eac5332a4a8221ede85de23ccc524850a',
+              'source_manifest_sha256': 'd5e13bc3ba905888ae18f68d64dfa03950f1719bad39bfdca2dc094fa7adeba7',
+              'source_inventory_sha256': '4c2d54c3c2a4e042965264ed5c0bf130e6296935c7ade9247b3aed9824fefcaa',
+              'release_sha256': '1d9945489c033270e6346e3ac73af130ee1407ab6a6499b44d87efffc5ce4471',
+              'firstboot_sha256': '4751a01a9354e10a3d9602b99a2e4c3aff7c63a6d71259c7a718828ed2903806',
+          }
+
+          config = yaml.safe_load(Path('aef-worker-v6.yaml').read_text(encoding='utf-8'))
+          source_root = Path('/tmp/aef-public-source')
+          output_root = Path('/tmp/aef-public-output')
+          shutil.rmtree(source_root, ignore_errors=True)
+          shutil.rmtree(output_root, ignore_errors=True)
+          source_root.mkdir(parents=True)
+          output_root.mkdir(parents=True)
+
+          prefix = Path('/opt/aef/bootstrap-source-v6')
+          extracted = 0
+          for record in config['write_files']:
+              path = Path(record['path'])
+              try:
+                  relative = path.relative_to(prefix)
+              except ValueError:
+                  continue
+              assert record.get('encoding') == 'b64', record['path']
+              data = base64.b64decode(str(record['content']).encode('ascii'), validate=True)
+              target = source_root / relative
+              target.parent.mkdir(parents=True, exist_ok=True)
+              target.write_bytes(data)
+              target.chmod(0o444)
+              extracted += 1
+          assert extracted == 53, extracted
+
+          firstboot = source_root / 'bootstrap/aef_worker_v6_firstboot.py'
+          text = firstboot.read_text(encoding='utf-8')
+          marker = '_MACHINE_ID_RE = re.compile(r"^[0-9a-f]{32}$")\n'
+          assert text.count(marker) == 1
+          text = text.replace(
+              marker,
+              marker + '_WORKER_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{1,119}$")\n',
+              1,
+          )
+          old_explicit = '        if re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._:-]{2,127}", explicit) is None:\n'
+          new_explicit = '        if _WORKER_ID_RE.fullmatch(explicit) is None:\n'
+          assert text.count(old_explicit) == 1
+          text = text.replace(old_explicit, new_explicit, 1)
+          old_return = '    return f"digitalocean:v6:{machine_id}"\n'
+          new_return = (
+              '    worker_id = f"digitalocean-v6-{machine_id}"\n'
+              '    if _WORKER_ID_RE.fullmatch(worker_id) is None:\n'
+              '        raise FirstBootError("WORKER_ID_INVALID", worker_id)\n'
+              '    return worker_id\n'
+          )
+          assert text.count(old_return) == 1
+          text = text.replace(old_return, new_return, 1)
+          firstboot.chmod(0o644)
+          firstboot.write_text(text, encoding='utf-8')
+          firstboot.chmod(0o444)
+          assert hashlib.sha256(firstboot.read_bytes()).hexdigest() == EXPECTED['firstboot_sha256']
+
+          generator = source_root / 'bootstrap/inline_user_data_v6.py'
+          generator.parent.mkdir(parents=True, exist_ok=True)
+          shutil.copyfile('.staging/aef-public-13/inline_user_data_v6.py', generator)
+          generator.chmod(0o555)
+
+          yaml_out = output_root / 'aef-worker-v6.yaml'
+          manifest_out = output_root / 'aef-worker-v6-manifest.json'
+          source_manifest_out = output_root / 'aef-worker-v6-source-manifest.json'
+          subprocess.run(
+              [
+                  'python3', str(generator),
+                  '--repository-root', str(source_root),
+                  '--source-revision', SOURCE_REVISION,
+                  '--output', str(yaml_out),
+                  '--manifest-output', str(manifest_out),
+                  '--source-manifest-output', str(source_manifest_out),
+              ],
+              check=True,
+          )
+
+          artifact = yaml_out.read_bytes()
+          manifest_bytes = manifest_out.read_bytes()
+          source_manifest_bytes = source_manifest_out.read_bytes()
+          manifest = json.loads(manifest_bytes)
+          source_manifest = json.loads(source_manifest_bytes)
+          assert len(artifact) == EXPECTED['artifact_bytes']
+          assert hashlib.sha256(artifact).hexdigest() == EXPECTED['artifact_sha256']
+          assert hashlib.sha256(manifest_bytes).hexdigest() == EXPECTED['manifest_sha256']
+          assert hashlib.sha256(source_manifest_bytes).hexdigest() == EXPECTED['source_manifest_sha256']
+          assert source_manifest['inventory_sha256'] == EXPECTED['source_inventory_sha256']
+          assert manifest['worker_release_content_sha256'] == EXPECTED['release_sha256']
+          assert manifest['source_revision'] == SOURCE_REVISION
+          assert manifest['credential_values_present'] is False
+          assert manifest['protected_actions_performed'] is False
+          assert manifest['remote_dispatch'] is False
+          assert manifest['scheduler_cutover'] is False
+          assert manifest['active_mode'] is False
+          print(json.dumps({'status': 'PASS', **EXPECTED, 'source_revision': SOURCE_REVISION}, sort_keys=True))
+          PY
+
+      - name: Publish generated bytes to task branch
+        run: |
+          cp /tmp/aef-public-output/aef-worker-v6.yaml /tmp/aef-worker-v6.yaml
+          cp /tmp/aef-public-output/aef-worker-v6-manifest.json /tmp/aef-worker-v6-manifest.json
+          git fetch origin aef-public-13-v6-republish
+          git switch aef-public-13-v6-republish
+          cp /tmp/aef-worker-v6.yaml aef-worker-v6.yaml
+          cp /tmp/aef-worker-v6-manifest.json aef-worker-v6-manifest.json
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add aef-worker-v6.yaml aef-worker-v6-manifest.json
+          git diff --cached --quiet && exit 0
+          git commit -m 'AEF-PUBLIC#13 stage corrected worker-v6 distribution'
+          git push origin HEAD:aef-public-13-v6-republish
