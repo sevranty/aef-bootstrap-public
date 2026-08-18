@@ -11,7 +11,7 @@ https://github.com/sevranty/agent-execution-fabric/issues/61
 Current publication task:
 https://github.com/sevranty/aef-bootstrap-public/issues/13
 
-## Current canonical worker-v6 bootstrap for AEF#61
+## Current corrected worker-v6 bootstrap for AEF#61
 
 Source task:
 https://github.com/sevranty/agent-execution-fabric/issues/61
@@ -20,16 +20,15 @@ Publication task:
 https://github.com/sevranty/aef-bootstrap-public/issues/13
 
 Source AEF merge:
-`e3c9e0bb460639cf77ec69fb43769ade74a498a1`
+`5966c258c4f90e0eb823282d080e84c37b895471`
 
-Published candidate files:
-- `aef-worker-v6.yaml` - 382387 bytes, SHA-256 `2d77df7875c7509b81a05d45b6c00357f199a05e5e9f47e78398a1af5a07c649`
-- `aef-worker-v6-manifest.json` - 1580 bytes, SHA-256 `43a020f8f34888b701c44380dcfd17dcb87572fb9cd3be83b162a98660063cb3`
-- `aef-worker-v6-digitalocean-user-data.txt` - 132 bytes, SHA-256 `7548f8385f228d6125306a0b3c54d49376a34e68f20ba01febed98a655126a13`
+Current distribution files:
+- `aef-worker-v6.yaml` - 382623 bytes, SHA-256 `99d41126f1499e376260c126be3b5807f7d99be1765a2145c28fd3ced179f6cf`
+- `aef-worker-v6-manifest.json` - 1580 bytes, SHA-256 `45778b919d5aa1cece200580d313495eac5332a4a8221ede85de23ccc524850a`
 
 Pinned identities:
-- source inventory SHA-256 `2c85e3e59f394e87b19f385325f539b67e015f1d5914bc5ddbb0f0cf17ad3e4a`
-- source manifest SHA-256 `ecc91ce6ed6bd0eeabdcece769053d5e44c892cc2a2c2426757da275e0ac094d`
+- source inventory SHA-256 `4c2d54c3c2a4e042965264ed5c0bf130e6296935c7ade9247b3aed9824fefcaa`
+- source manifest SHA-256 `d5e13bc3ba905888ae18f68d64dfa03950f1719bad39bfdca2dc094fa7adeba7`
 - worker release content SHA-256 `1d9945489c033270e6346e3ac73af130ee1407ab6a6499b44d87efffc5ce4471`
 - path contract `path-contract-v2`
 - capability set `capability-set-v1`
@@ -37,30 +36,31 @@ Pinned identities:
 
 The v6 distribution is intentionally pre-authorization and pre-ACTIVE. It contains no credential values and performs no DigitalOcean provider mutation, remote dispatch, scheduler cutover or ACTIVE transition. Workload package installation is forbidden. GitHub CLI is installed declaratively before job admission.
 
-After a clean host completes bootstrap and all local readiness checks pass, the only prepared owner command is:
+### Why this worker-v6 revision supersedes the previous one
+
+The previous public distribution passed repository/public checks but the first new clean DigitalOcean host `aef-worker-06` factually failed canonical firstboot with `WORKER_ID_INVALID` before bootstrap evidence was created.
+
+Root cause in AEF#61: the old bootstrap derived `digitalocean:v6:<machine-id>`, while the worker-v6 runtime/config contract permits `[A-Za-z0-9._-]`. AEF PR#314 corrected automatic identity to `digitalocean-v6-<32hex-machine-id>` without weakening the existing worker-v6 grammar.
+
+The corrected AEF clean-bootstrap workflow no longer supplies an artificial `--worker-id`; canonical-root acceptance proved the real auto-derived path, `WORKER_V6_FIRSTBOOT_PASS`, READY, declarative GitHub CLI install/verify, doctor, preflight, REP#191 admission and the `GITHUB_BROWSER_AUTH_REQUIRED` stop gate.
+
+`aef-worker-06` remains failed clean-host evidence and is not repaired or rebootstrapped.
+
+After a future clean host completes bootstrap and all local readiness checks pass, the only prepared owner command is:
 
 `sudo aefctl --format json credentials github login --then-run report.rep191-lifeops-refresh.shadow`
 
-That command is not authorization to run it. AEF#61 requires a separate owner decision before creation of a new DigitalOcean Droplet. After creation, the browser-auth command may execute exactly one prepared REP#191 SHADOW and must stop before ACTIVE or scheduler cutover.
+That command is not authorization to run it. The browser-auth command may execute exactly one prepared REP#191 SHADOW and must stop before ACTIVE or scheduler cutover.
 
-### DigitalOcean user-data transport
+### DigitalOcean user-data transport: temporarily unavailable pending immutable repin
 
 The canonical cloud-config is larger than the DigitalOcean plain-text `user_data` limit, so it must not be pasted directly into the Droplet creation form.
 
-Use only `aef-worker-v6-digitalocean-user-data.txt` as the DigitalOcean Startup script. It is a cloud-init `#include` payload and points to the canonical cloud-config in immutable public merge `aad3ad6f7eb960d5e33bb550d29e6bcbfb26e1fc`.
+The previous `aef-worker-v6-digitalocean-user-data.txt` pointed to the superseded worker-v6 artifact and has therefore been removed fail-closed in this publication stage.
 
-The transport contract is deliberately narrow:
-- exact payload size: 132 bytes
-- exact payload SHA-256: `7548f8385f228d6125306a0b3c54d49376a34e68f20ba01febed98a655126a13`
-- no trailing newline
-- HTTPS only
-- `raw.githubusercontent.com` only
-- exact repository `sevranty/aef-bootstrap-public`
-- exact 40-hex immutable commit
-- exact target file `aef-worker-v6.yaml`
-- target readback must be 382387 bytes with SHA-256 `2d77df7875c7509b81a05d45b6c00357f199a05e5e9f47e78398a1af5a07c649`
+**Do not create a new AEF worker from the current intermediate public state.** AEF-PUBLIC#13 requires a second publication step after this corrected artifact is merged. That step will recreate the 132-byte cloud-init `#include` using the factual immutable public merge SHA of this corrected `aef-worker-v6.yaml`, validate network readback and then expose the next canonical DigitalOcean provider payload.
 
-A mutable `main` or task-branch URL is forbidden.
+A mutable `main` or task-branch URL remains forbidden.
 
 ## Current AEF#207 diagnostic-safe SHADOW v2 actuator
 
@@ -201,12 +201,13 @@ Bootstrap v3 incorporated canonical Ubuntu 24.04 provider parity and exact no-te
 - no private AEF source-tree mirror beyond explicitly approved exact secret-free distribution artifacts
 - immutable commit URLs are required for DigitalOcean bootstrap and protected pre-auth activation helpers
 - mutable branch URLs must not be used for worker creation or live owner invocation
-- public validation pins bootstrap v3, v4, v5, worker v6 and AEF#207 SHADOW actuator v1 + v2 identities
+- public validation pins bootstrap v3, v4, v5, corrected worker v6 and AEF#207 SHADOW actuator v1 + v2 identities
 - public validation pins v2 byte count, SHA-256, Git blob, manifest contract and `protected_retry_authorized=false`
 - public validation checks forbidden credential markers across both AEF#207 actuator generations
 - public validation also pins the v5 GitHub CLI asset identity and capability contract
-- public validation pins worker-v6 byte count, SHA-256, manifest, source revision, source inventory, release checksum and negative safety flags
-- public validation pins the DigitalOcean user-data include payload and its immutable target readback
+- public validation pins corrected worker-v6 byte count, SHA-256, manifest, source revision, source inventory, release checksum and negative safety flags
+- public validation requires auto-derived worker-v6 identity on public-only clean reconstruction
+- provider payload is deliberately absent until a factual immutable public merge SHA is available for repin
 - public validation checks forbidden credential markers in published bootstrap and actuator artifacts
 
-DigitalOcean must use only the exact `aef-worker-v6-digitalocean-user-data.txt` payload for AEF#61 creation. The referenced target is immutable and checksum-pinned. Do not use a URL containing `main` or another mutable branch name.
+DigitalOcean creation for the next AEF#61 clean host remains blocked until AEF-PUBLIC#13 recreates and validates the immutable `aef-worker-v6-digitalocean-user-data.txt` payload in the second publication stage.
