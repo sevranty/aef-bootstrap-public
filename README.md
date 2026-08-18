@@ -78,6 +78,17 @@ Published files:
 - `aef207-rep191-shadow-live.py` - byte-identical to private source Git blob `4a05e0be9632c7f726b6ad3080f4e1bb16606e88`, SHA-256 `489d44e8d1861b123b21e87baf2377e26d62ca2909fb4fed33722661295a6845`;
 - `aef207-rep191-shadow-live-manifest.json` - secret-free source/distribution identity.
 
+The v1 actuator exists only for the explicitly authorized historical AEF#61 decision `AEF61-REP191-PROTECTED-SHADOW-V1`:
+- target worker is exactly `digitalocean:592813728`;
+- owner interaction is one checksum-pinned invocation plus one GitHub browser-auth flow if auth is absent;
+- source staging uses GitHub contents API `GET` only;
+- the exact REP#214 SHADOW bundle is verified before atomic publication;
+- one bounded worker enrollment record is materialized;
+- exactly one REP#191 `live-shadow` is executed;
+- terminal evidence must explicitly report `mutation_performed=false` and `github_mutation_performed=false`;
+- remote dispatch, hourly scheduling, owner-local scheduler cutover, higher generation/fence, DigitalOcean changes and REPORT/source mutation are unavailable;
+- the process stops after terminal SHADOW evidence.
+
 The v1 publication is retained as immutable historical evidence and is not authorization to retry it.
 
 ## Current bootstrap v5
@@ -173,6 +184,9 @@ Bootstrap v3 incorporated canonical Ubuntu 24.04 provider parity and exact no-te
 - immutable commit URLs are required for DigitalOcean bootstrap and protected pre-auth activation helpers
 - mutable branch URLs must not be used for worker creation or live owner invocation
 - public validation pins bootstrap v3, v4, v5, worker v6 and AEF#207 SHADOW actuator v1 + v2 identities
+- public validation pins v2 byte count, SHA-256, Git blob, manifest contract and `protected_retry_authorized=false`
+- public validation checks forbidden credential markers across both AEF#207 actuator generations
+- public validation also pins the v5 GitHub CLI asset identity and capability contract
 - public validation pins worker-v6 byte count, SHA-256, manifest, source revision, source inventory, release checksum and negative safety flags
 - public validation checks forbidden credential markers in published bootstrap and actuator artifacts
 
