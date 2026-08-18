@@ -35,7 +35,7 @@ jobs:
         with:
           persist-credentials: false
 
-      - name: Verify exact worker-v6 distribution
+      - name: Verify exact corrected worker-v6 distribution
         run: |
           python3 - <<'PY'
           import hashlib
@@ -53,12 +53,12 @@ jobs:
               'schema_version': 6,
               'task_id': 'AEF#61',
               'artifact': 'aef-worker-v6.yaml',
-              'artifact_bytes': 382387,
-              'artifact_sha256': '2d77df7875c7509b81a05d45b6c00357f199a05e5e9f47e78398a1af5a07c649',
-              'source_revision': 'e3c9e0bb460639cf77ec69fb43769ade74a498a1',
+              'artifact_bytes': 382623,
+              'artifact_sha256': '99d41126f1499e376260c126be3b5807f7d99be1765a2145c28fd3ced179f6cf',
+              'source_revision': '5966c258c4f90e0eb823282d080e84c37b895471',
               'source_file_count': 53,
-              'source_inventory_sha256': '2c85e3e59f394e87b19f385325f539b67e015f1d5914bc5ddbb0f0cf17ad3e4a',
-              'source_manifest_sha256': 'ecc91ce6ed6bd0eeabdcece769053d5e44c892cc2a2c2426757da275e0ac094d',
+              'source_inventory_sha256': '4c2d54c3c2a4e042965264ed5c0bf130e6296935c7ade9247b3aed9824fefcaa',
+              'source_manifest_sha256': 'd5e13bc3ba905888ae18f68d64dfa03950f1719bad39bfdca2dc094fa7adeba7',
               'worker_profile_id': 'aef-worker-v6-default',
               'worker_release_id': 'aef-worker-v6',
               'worker_release_content_sha256': '1d9945489c033270e6346e3ac73af130ee1407ab6a6499b44d87efffc5ce4471',
@@ -88,7 +88,7 @@ jobs:
           assert artifact.startswith(b'#cloud-config\n')
           assert len(artifact) == expected['artifact_bytes']
           assert hashlib.sha256(artifact).hexdigest() == expected['artifact_sha256']
-          assert hashlib.sha256(manifest_bytes).hexdigest() == '43a020f8f34888b701c44380dcfd17dcb87572fb9cd3be83b162a98660063cb3'
+          assert hashlib.sha256(manifest_bytes).hexdigest() == '45778b919d5aa1cece200580d313495eac5332a4a8221ede85de23ccc524850a'
 
           forbidden = (
               re.compile(rb'ghp_[A-Za-z0-9]{20,}'),
@@ -99,41 +99,18 @@ jobs:
           for name, payload in ((artifact_path.name, artifact), (manifest_path.name, manifest_bytes)):
               for pattern in forbidden:
                   assert pattern.search(payload) is None, (name, pattern.pattern)
+          print(json.dumps({'status': 'PASS', 'source_revision': manifest['source_revision'], 'artifact_sha256': manifest['artifact_sha256']}, sort_keys=True))
           PY
 
-      - name: Verify DigitalOcean immutable include transport
+      - name: Require provider payload to stay absent until immutable repin
         run: |
-          python3 - <<'PY'
-          import hashlib
-          import re
-          import urllib.request
-          from pathlib import Path
+          test ! -e aef-worker-v6-digitalocean-user-data.txt
 
-          path = Path('aef-worker-v6-digitalocean-user-data.txt')
-          payload = path.read_bytes()
-          expected_url = 'https://raw.githubusercontent.com/sevranty/aef-bootstrap-public/aad3ad6f7eb960d5e33bb550d29e6bcbfb26e1fc/aef-worker-v6.yaml'
-          expected_payload = ('#include\n' + expected_url).encode('ascii')
-          assert payload == expected_payload
-          assert len(payload) == 132
-          assert len(payload) <= 512
-          assert len(payload) <= 64 * 1024
-          assert hashlib.sha256(payload).hexdigest() == '7548f8385f228d6125306a0b3c54d49376a34e68f20ba01febed98a655126a13'
-          assert not payload.endswith(b'\n')
-          assert re.fullmatch(rb'#include\nhttps://raw\.githubusercontent\.com/sevranty/aef-bootstrap-public/[0-9a-f]{40}/aef-worker-v6\.yaml', payload)
-
-          request = urllib.request.Request(expected_url, headers={'User-Agent': 'aef-public-v6-validator'})
-          with urllib.request.urlopen(request, timeout=30) as response:
-              target = response.read(382388)
-          assert len(target) == 382387
-          assert target.startswith(b'#cloud-config\n')
-          assert hashlib.sha256(target).hexdigest() == '2d77df7875c7509b81a05d45b6c00357f199a05e5e9f47e78398a1af5a07c649'
-          assert target == Path('aef-worker-v6.yaml').read_bytes()
-          PY
-
-      - name: Reconstruct clean worker from public artifact only
+      - name: Reconstruct clean worker from public artifact only with auto-derived identity
         env:
           PUBLIC_ROOT: ${{ runner.temp }}/aef-public-worker-v6
-          SOURCE_REVISION: e3c9e0bb460639cf77ec69fb43769ade74a498a1
+          SOURCE_REVISION: 5966c258c4f90e0eb823282d080e84c37b895471
+          MACHINE_ID: 0123456789abcdef0123456789abcdef
         run: |
           rm -rf "$PUBLIC_ROOT"
           mkdir -p "$PUBLIC_ROOT"
@@ -159,6 +136,10 @@ jobs:
               payload = base64.b64decode(raw, validate=True) if record.get('encoding') == 'b64' else raw
               target.write_bytes(payload)
               target.chmod(int(str(record.get('permissions', '0644')), 8))
+          machine_id_path = root / 'etc/machine-id'
+          machine_id_path.parent.mkdir(parents=True, exist_ok=True)
+          machine_id_path.write_text(os.environ['MACHINE_ID'] + '\n', encoding='ascii')
+          machine_id_path.chmod(0o444)
           PY
           /usr/bin/python3 -I -B \
             "$PUBLIC_ROOT/opt/aef/bootstrap-source-v6/bootstrap/aef_worker_v6_firstboot.py" \
@@ -166,26 +147,27 @@ jobs:
             --source-manifest "$PUBLIC_ROOT/etc/aef/bootstrap-source-v6.json" \
             --source-revision "$SOURCE_REVISION" \
             --root "$PUBLIC_ROOT" \
-            --worker-id public-ci-worker-v6 \
             --synthetic > "$PUBLIC_ROOT/result.json"
-          PUBLIC_ROOT="$PUBLIC_ROOT" python3 - <<'PY'
+          PUBLIC_ROOT="$PUBLIC_ROOT" MACHINE_ID="$MACHINE_ID" python3 - <<'PY'
           import json
           import os
           from pathlib import Path
           value = json.loads((Path(os.environ['PUBLIC_ROOT']) / 'result.json').read_text())
+          expected_worker_id = 'digitalocean-v6-' + os.environ['MACHINE_ID']
           assert value['status'] == 'PASS', value
           assert value['code'] == 'WORKER_V6_FIRSTBOOT_PASS', value
+          assert value['worker_id'] == expected_worker_id, value
+          assert value['reconstruction']['worker_id'] == expected_worker_id, value
           assert value['reconstruction']['health']['state'] == 'READY', value
           assert value['credential_values_present'] is False, value
           assert value['remote_dispatch'] is False, value
           assert value['scheduler_cutover'] is False, value
           assert value['active_mode'] is False, value
           assert value['protected_actions'] is False, value
-          print(json.dumps({'status': 'PASS', 'code': value['code'], 'state': 'READY'}, sort_keys=True))
+          print(json.dumps({'status': 'PASS', 'code': value['code'], 'state': 'READY', 'worker_id': value['worker_id']}, sort_keys=True))
           PY
 
       - name: Verify Git tree modes
         run: |
           test "$(git ls-files -s aef-worker-v6.yaml | awk '{print $1}')" = "100644"
           test "$(git ls-files -s aef-worker-v6-manifest.json | awk '{print $1}')" = "100644"
-          test "$(git ls-files -s aef-worker-v6-digitalocean-user-data.txt | awk '{print $1}')" = "100644"
