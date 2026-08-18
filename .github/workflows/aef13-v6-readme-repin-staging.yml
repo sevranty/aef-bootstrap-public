@@ -1,0 +1,56 @@
+name: AEF13 v6 README repin staging
+
+on:
+  push:
+    branches:
+      - aef-public-13-v6-republish-staging
+    paths:
+      - .github/workflows/aef13-v6-readme-repin-staging.yml
+
+permissions:
+  contents: write
+
+jobs:
+  repin-readme:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: Checkout staging revision
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: true
+          fetch-depth: 0
+
+      - name: Apply exact README repin to task branch
+        run: |
+          git fetch origin aef-public-13-v6-provider-repin
+          git switch aef-public-13-v6-provider-repin
+          python3 - <<'PY'
+          from pathlib import Path
+
+          path = Path('README.md')
+          text = path.read_text(encoding='utf-8')
+
+          old_files = """Current distribution files:\n- `aef-worker-v6.yaml` - 382623 bytes, SHA-256 `99d41126f1499e376260c126be3b5807f7d99be1765a2145c28fd3ced179f6cf`\n- `aef-worker-v6-manifest.json` - 1580 bytes, SHA-256 `45778b919d5aa1cece200580d313495eac5332a4a8221ede85de23ccc524850a`\n"""
+          new_files = old_files + "- `aef-worker-v6-digitalocean-user-data.txt` - 132 bytes, SHA-256 `f44e2f93dd292bd75961ecfa5e005b8ee6fd3a4918c66a6cd0d1d3651c2b24a5`\n"
+          assert text.count(old_files) == 1
+          text = text.replace(old_files, new_files, 1)
+
+          old_transport = """### DigitalOcean user-data transport: temporarily unavailable pending immutable repin\n\nThe canonical cloud-config is larger than the DigitalOcean plain-text `user_data` limit, so it must not be pasted directly into the Droplet creation form.\n\nThe previous `aef-worker-v6-digitalocean-user-data.txt` pointed to the superseded worker-v6 artifact and has therefore been removed fail-closed in this publication stage.\n\n**Do not create a new AEF worker from the current intermediate public state.** AEF-PUBLIC#13 requires a second publication step after this corrected artifact is merged. That step will recreate the 132-byte cloud-init `#include` using the factual immutable public merge SHA of this corrected `aef-worker-v6.yaml`, validate network readback and then expose the next canonical DigitalOcean provider payload.\n\nA mutable `main` or task-branch URL remains forbidden.\n"""
+          new_transport = """### DigitalOcean user-data transport\n\nThe canonical cloud-config is larger than the DigitalOcean plain-text `user_data` limit, so it must not be pasted directly into the Droplet creation form.\n\nUse only `aef-worker-v6-digitalocean-user-data.txt` as the Startup Script for the next separately authorized clean AEF worker. It contains exactly two physical lines and no terminal newline:\n\n```text\n#include\nhttps://raw.githubusercontent.com/sevranty/aef-bootstrap-public/d613cf39c8c967e618098d0f964a6ac515beee4a/aef-worker-v6.yaml\n```\n\nExact transport identity:\n- payload bytes: 132\n- payload SHA-256: `f44e2f93dd292bd75961ecfa5e005b8ee6fd3a4918c66a6cd0d1d3651c2b24a5`\n- terminal newline: false\n- immutable target merge: `d613cf39c8c967e618098d0f964a6ac515beee4a`\n- target bytes: 382623\n- target SHA-256: `99d41126f1499e376260c126be3b5807f7d99be1765a2145c28fd3ced179f6cf`\n\nThe transport validator performs a network readback of that immutable target and requires byte-for-byte equality with the canonical public YAML. A mutable `main` or task-branch URL is forbidden.\n\n`aef-worker-06` remains failed clean-host evidence and must not be repaired or reused for acceptance. The next clean acceptance host is `aef-worker-07` only after a separate explicit owner authorization in AEF#61.\n"""
+          assert text.count(old_transport) == 1
+          text = text.replace(old_transport, new_transport, 1)
+
+          old_security = """- provider payload is deliberately absent until a factual immutable public merge SHA is available for repin\n- public validation checks forbidden credential markers in published bootstrap and actuator artifacts\n\nDigitalOcean creation for the next AEF#61 clean host remains blocked until AEF-PUBLIC#13 recreates and validates the immutable `aef-worker-v6-digitalocean-user-data.txt` payload in the second publication stage.\n"""
+          new_security = """- public validation pins the 132-byte DigitalOcean provider payload to immutable corrected worker-v6 merge `d613cf39c8c967e618098d0f964a6ac515beee4a` and validates target network readback\n- public validation checks forbidden credential markers in published bootstrap and actuator artifacts\n\nThe public distribution is ready for a separately owner-authorized new clean AEF#61 acceptance host. Publication itself does not authorize DigitalOcean creation, browser authentication, REP#191 SHADOW, remote dispatch, scheduler cutover or ACTIVE.\n"""
+          assert text.count(old_security) == 1
+          text = text.replace(old_security, new_security, 1)
+
+          path.write_text(text, encoding='utf-8')
+          PY
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add README.md
+          git diff --cached --quiet && exit 0
+          git commit -m 'AEF-PUBLIC#13 document immutable corrected worker-v6 transport'
+          git push origin HEAD:aef-public-13-v6-provider-repin
