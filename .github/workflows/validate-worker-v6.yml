@@ -1,0 +1,114 @@
+name: Validate worker v6 bootstrap
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - aef-worker-v6.yaml
+      - aef-worker-v6-manifest.json
+      - README.md
+      - .github/workflows/validate-worker-v6.yml
+  push:
+    branches: [main]
+    paths:
+      - aef-worker-v6.yaml
+      - aef-worker-v6-manifest.json
+      - README.md
+      - .github/workflows/validate-worker-v6.yml
+
+permissions:
+  contents: read
+
+concurrency:
+  group: worker-v6-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  validate-worker-v6:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - name: Checkout exact revision
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Verify exact worker-v6 distribution
+        run: |
+          python3 - <<'PY'
+          import hashlib
+          import json
+          import re
+          from pathlib import Path
+
+          artifact_path = Path('aef-worker-v6.yaml')
+          manifest_path = Path('aef-worker-v6-manifest.json')
+          artifact = artifact_path.read_bytes()
+          manifest_bytes = manifest_path.read_bytes()
+          manifest = json.loads(manifest_bytes)
+
+          expected = {
+              'schema_version': 6,
+              'task_id': 'AEF#61',
+              'artifact': 'aef-worker-v6.yaml',
+              'artifact_bytes': 381512,
+              'artifact_sha256': '2d77d9c6a908d5f06c1be883f0c900802337ce95369182e9ddc31a29cc6aa10a',
+              'source_revision': 'e3c9bf15ff7d35fa39cac7b0d2833d65ceb33e91',
+              'source_file_count': 53,
+              'source_inventory_sha256': 'd7d1153172fcc291c8803ce2da93ea93229eb98461ac6ec056665e753d0f5479',
+              'source_manifest_sha256': '34e8b9f1fb823fa3a2b8bcb810cb062a94975dd4ffe5047bb391b9d96f9221fc',
+              'worker_profile_id': 'aef-worker-v6-default',
+              'worker_release_id': 'aef-worker-v6',
+              'worker_release_content_sha256': 'b581943e04f6b6f5487efd41220320169de261e27404bdb99b4175ba91805314',
+              'path_contract_revision': 'path-contract-v2',
+              'capability_set_revision': 'capability-set-v1',
+              'credential_values_present': False,
+              'protected_actions_performed': False,
+              'remote_dispatch': False,
+              'scheduler_cutover': False,
+              'active_mode': False,
+              'runtime_package_installation': 'forbidden',
+              'distribution_state': 'PUBLICATION_REQUIRED',
+              'post_bootstrap_owner_command': 'sudo aefctl --format json credentials github login --then-run report.rep191-lifeops-refresh.shadow',
+          }
+          for key, value in expected.items():
+              assert manifest.get(key) == value, (key, manifest.get(key), value)
+
+          github_cli = manifest.get('github_cli')
+          assert github_cli == {
+              'entrypoint': '/opt/aef/capabilities/github-cli/2.97.0/bin/gh',
+              'member_sha256': '141507c337e8b202ad398550c3b73d72f5af92e86f71665214538a81efd4c409',
+              'source_bytes': 14770812,
+              'source_sha256': 'a2c9b8497e1f85b1ad0dfcb78b5a622e098801b8e461e459e88e1ee12f018112',
+              'source_url': 'https://github.com/cli/cli/releases/download/v2.97.0/gh_2.97.0_linux_amd64.tar.gz',
+              'version': '2.97.0',
+          }, github_cli
+
+          assert artifact.startswith(b'#cloud-config\n')
+          assert len(artifact) == expected['artifact_bytes']
+          assert hashlib.sha256(artifact).hexdigest() == expected['artifact_sha256']
+          assert hashlib.sha256(manifest_bytes).hexdigest() == '43a01c9569ecea8996285ba31ca6ab2ad92adddab6cc4c5da09264addfed561a'
+
+          forbidden = (
+              re.compile(rb'ghp_[A-Za-z0-9]{20,}'),
+              re.compile(rb'github_pat_[A-Za-z0-9_]{20,}'),
+              re.compile(rb'-----BEGIN [A-Z ]*PRIVATE KEY-----'),
+              re.compile(rb'DIGITALOCEAN_ACCESS_TOKEN\s*[=:]\s*[^\s"\']+'),
+          )
+          for name, payload in ((artifact_path.name, artifact), (manifest_path.name, manifest_bytes)):
+              for pattern in forbidden:
+                  assert pattern.search(payload) is None, (name, pattern.pattern)
+
+          print(json.dumps({
+              'status': 'PASS',
+              'artifact_sha256': hashlib.sha256(artifact).hexdigest(),
+              'manifest_sha256': hashlib.sha256(manifest_bytes).hexdigest(),
+              'source_revision': manifest['source_revision'],
+              'protected_actions_performed': False,
+          }, sort_keys=True))
+          PY
+
+      - name: Verify Git tree modes
+        run: |
+          test "$(git ls-files -s aef-worker-v6.yaml | awk '{print $1}')" = "100644"
+          test "$(git ls-files -s aef-worker-v6-manifest.json | awk '{print $1}')" = "100644"
