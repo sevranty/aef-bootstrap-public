@@ -1,2 +1,0 @@
-#include
-https://raw.githubusercontent.com/sevranty/aef-bootstrap-public/aad3ad6f7eb960d5e33bb550d29e6bcbfb26e1fc/aef-worker-v6.yaml
