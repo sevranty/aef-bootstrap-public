@@ -176,9 +176,6 @@ Bootstrap v4 established root-mode clean-host acceptance, bytecode-free runtime 
 Publication task:
 https://github.com/sevranty/aef-bootstrap-public/issues/3
 
-Source task:
-https://github.com/sevranty/agent-execution-fabric/issues/150
-
 Source AEF merge:
 b36dfe677d446d77d093ec9975aaca75515c613d
 
