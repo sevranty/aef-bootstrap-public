@@ -20,16 +20,16 @@ Publication task:
 https://github.com/sevranty/aef-bootstrap-public/issues/13
 
 Source AEF merge:
-`e3c9bf15ff7d35fa39cac7b0d2833d65ceb33e91`
+`e3c9e0bb460639cf77ec69fb43769ade74a498a1`
 
 Published candidate files:
-- `aef-worker-v6.yaml` - 381512 bytes, SHA-256 `2d77d9c6a908d5f06c1be883f0c900802337ce95369182e9ddc31a29cc6aa10a`
-- `aef-worker-v6-manifest.json` - secret-free exact source and distribution identity, SHA-256 `43a01c9569ecea8996285ba31ca6ab2ad92adddab6cc4c5da09264addfed561a`
+- `aef-worker-v6.yaml` - 382387 bytes, SHA-256 `2d77df7875c7509b81a05d45b6c00357f199a05e5e9f47e78398a1af5a07c649`
+- `aef-worker-v6-manifest.json` - 1580 bytes, SHA-256 `43a020f8f34888b701c44380dcfd17dcb87572fb9cd3be83b162a98660063cb3`
 
 Pinned identities:
-- source inventory SHA-256 `d7d1153172fcc291c8803ce2da93ea93229eb98461ac6ec056665e753d0f5479`
-- source manifest SHA-256 `34e8b9f1fb823fa3a2b8bcb810cb062a94975dd4ffe5047bb391b9d96f9221fc`
-- worker release content SHA-256 `b581943e04f6b6f5487efd41220320169de261e27404bdb99b4175ba91805314`
+- source inventory SHA-256 `2c85e3e59f394e87b19f385325f539b67e015f1d5914bc5ddbb0f0cf17ad3e4a`
+- source manifest SHA-256 `ecc91ce6ed6bd0eeabdcece769053d5e44c892cc2a2c2426757da275e0ac094d`
+- worker release content SHA-256 `1d9945489c033270e6346e3ac73af130ee1407ab6a6499b44d87efffc5ce4471`
 - path contract `path-contract-v2`
 - capability set `capability-set-v1`
 - GitHub CLI `2.97.0`, exact archive and binary checksums recorded in the manifest
