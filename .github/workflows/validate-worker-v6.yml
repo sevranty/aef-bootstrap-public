@@ -1,4 +1,4 @@
-name: Validate worker v6 bootstrap
+name: Validate worker v6 public artifact
 
 on:
   pull_request:
@@ -6,195 +6,321 @@ on:
     paths:
       - aef-worker-v6.yaml
       - aef-worker-v6-manifest.json
+      - aef-worker-v6-source-manifest.json
       - aef-worker-v6-digitalocean-user-data.txt
-      - README.md
       - .github/workflows/validate-worker-v6.yml
   push:
     branches: [main]
     paths:
       - aef-worker-v6.yaml
       - aef-worker-v6-manifest.json
+      - aef-worker-v6-source-manifest.json
       - aef-worker-v6-digitalocean-user-data.txt
-      - README.md
       - .github/workflows/validate-worker-v6.yml
 
 permissions:
   contents: read
 
 concurrency:
-  group: worker-v6-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  group: validate-worker-v6-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: true
 
 jobs:
   validate-worker-v6:
     runs-on: ubuntu-24.04
-    timeout-minutes: 10
+    timeout-minutes: 15
     steps:
       - name: Checkout exact revision
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
 
-      - name: Verify exact corrected worker-v6 distribution
+      - name: Verify environment parity
         run: |
+          test "$(. /etc/os-release && printf '%s' "$VERSION_ID")" = "24.04"
+          test "$(/usr/bin/python3 -c 'import sys; print("%d.%d" % sys.version_info[:2])')" = "3.12"
+          test "$(stat -f -c %T /run)" = "tmpfs"
+
+      - name: Verify immutable public identities
+        run: |
+          test -f aef-worker-v6.yaml
+          test -f aef-worker-v6-manifest.json
+          test -f aef-worker-v6-source-manifest.json
+          test ! -e aef-worker-v6-digitalocean-user-data.txt
+          test "$(stat -c %s aef-worker-v6.yaml)" = "391223"
+          test "$(sha256sum aef-worker-v6.yaml | cut -d' ' -f1)" = "d986ee5a6ce19c09f809cbc111068b4b94cd4bd0dbc01a280886ee906e5938e3"
+          test "$(sha256sum aef-worker-v6-source-manifest.json | cut -d' ' -f1)" = "5d8c9be157eb81536012e22e04285fb1290fcd7ce7e72f28500740c72ce998ac"
           python3 - <<'PY'
           import hashlib
           import json
-          import re
           from pathlib import Path
 
-          artifact_path = Path('aef-worker-v6.yaml')
-          manifest_path = Path('aef-worker-v6-manifest.json')
-          artifact = artifact_path.read_bytes()
-          manifest_bytes = manifest_path.read_bytes()
-          manifest = json.loads(manifest_bytes)
-
+          manifest = json.loads(Path('aef-worker-v6-manifest.json').read_text(encoding='ascii'))
+          source_raw = Path('aef-worker-v6-source-manifest.json').read_bytes()
+          source = json.loads(source_raw.decode('ascii'))
           expected = {
               'schema_version': 6,
               'task_id': 'AEF#61',
               'artifact': 'aef-worker-v6.yaml',
-              'artifact_bytes': 382623,
-              'artifact_sha256': '99d41126f1499e376260c126be3b5807f7d99be1765a2145c28fd3ced179f6cf',
-              'source_revision': '5966c258c4f90e0eb823282d080e84c37b895471',
+              'artifact_bytes': 391223,
+              'artifact_sha256': 'd986ee5a6ce19c09f809cbc111068b4b94cd4bd0dbc01a280886ee906e5938e3',
+              'source_revision': '5167f83b37aa8b2fc7c1ddab3ad6e6313eeca4b5',
               'source_file_count': 53,
-              'source_inventory_sha256': '4c2d54c3c2a4e042965264ed5c0bf130e6296935c7ade9247b3aed9824fefcaa',
-              'source_manifest_sha256': 'd5e13bc3ba905888ae18f68d64dfa03950f1719bad39bfdca2dc094fa7adeba7',
+              'source_inventory_sha256': '9eaf6b6ba1d0a3a777d6fcb8f646ce4c62fe0600d100074b0704d0013247bc9b',
+              'source_manifest_sha256': '5d8c9be157eb81536012e22e04285fb1290fcd7ce7e72f28500740c72ce998ac',
               'worker_profile_id': 'aef-worker-v6-default',
               'worker_release_id': 'aef-worker-v6',
-              'worker_release_content_sha256': '1d9945489c033270e6346e3ac73af130ee1407ab6a6499b44d87efffc5ce4471',
+              'worker_release_content_sha256': '8c69114c3d2eecec24b87acceb51d434f2ca83f9355933d84006f2396f5385b8',
               'path_contract_revision': 'path-contract-v2',
               'capability_set_revision': 'capability-set-v1',
+              'prepared_job': 'report.rep191-lifeops-refresh.shadow',
+              'post_bootstrap_owner_command': 'sudo aefctl --format json jobs inspect report.rep191-lifeops-refresh.shadow',
+              'max_workload_execution_seconds': 180,
+              'remote_hourly_scheduling': False,
+              'remote_recurring_scheduling': False,
+              'worker_service_mode': 'systemd-oneshot',
+              'worker_service_recurring': False,
+              'worker_service_polling': False,
+              'runtime_package_installation': 'forbidden',
               'credential_values_present': False,
-              'protected_actions_performed': False,
               'remote_dispatch': False,
               'scheduler_cutover': False,
               'active_mode': False,
-              'runtime_package_installation': 'forbidden',
+              'protected_actions_performed': False,
               'distribution_state': 'PUBLICATION_REQUIRED',
-              'post_bootstrap_owner_command': 'sudo aefctl --format json credentials github login --then-run report.rep191-lifeops-refresh.shadow',
           }
           for key, value in expected.items():
               assert manifest.get(key) == value, (key, manifest.get(key), value)
+          assert 'credentials github login' not in manifest['post_bootstrap_owner_command']
+          assert '--then-run' not in manifest['post_bootstrap_owner_command']
+          assert source['schema_version'] == 1
+          assert source['task_id'] == 'AEF#61'
+          assert source['source_revision'] == expected['source_revision']
+          assert len(source['files']) == expected['source_file_count']
+          declared_inventory = source['inventory_sha256']
+          unsigned = dict(source)
+          unsigned.pop('inventory_sha256')
+          canonical = (json.dumps(unsigned, ensure_ascii=True, separators=(',', ':'), sort_keys=True, allow_nan=False) + '\n').encode('ascii')
+          assert hashlib.sha256(canonical).hexdigest() == declared_inventory
+          assert declared_inventory == expected['source_inventory_sha256']
+          assert hashlib.sha256(source_raw).hexdigest() == expected['source_manifest_sha256']
+          PY
 
-          assert manifest.get('github_cli') == {
-              'entrypoint': '/opt/aef/capabilities/github-cli/2.97.0/bin/gh',
-              'member_sha256': '141507c337e8b202ad398550c3b73d72f5af92e86f71665214538a81efd4c409',
-              'source_bytes': 14770812,
-              'source_sha256': 'a2c9b8497e1f85b1ad0dfcb78b5a622e098801b8e461e459e88e1ee12f018112',
-              'source_url': 'https://github.com/cli/cli/releases/download/v2.97.0/gh_2.97.0_linux_amd64.tar.gz',
-              'version': '2.97.0',
+      - name: Extract and verify closed embedded source set
+        env:
+          SOURCE_DIR: ${{ runner.temp }}/aef-v6-source
+          SOURCE_MANIFEST: ${{ runner.temp }}/aef-v6-source-manifest.json
+        run: |
+          python3 - <<'PY'
+          import base64
+          import hashlib
+          import json
+          import os
+          from pathlib import Path
+
+          artifact = Path('aef-worker-v6.yaml').read_text(encoding='ascii').splitlines()
+          source_raw = Path('aef-worker-v6-source-manifest.json').read_bytes()
+          source = json.loads(source_raw.decode('ascii'))
+          blocks = {}
+          index = 0
+          while index < len(artifact):
+              line = artifact[index]
+              if not line.startswith('  - path: '):
+                  index += 1
+                  continue
+              path = line[len('  - path: '):]
+              fields = {}
+              index += 1
+              while index < len(artifact) and not artifact[index].startswith('  - path: ') and artifact[index] != 'runcmd:':
+                  current = artifact[index]
+                  if current.startswith('    ') and ': ' in current:
+                      key, value = current.strip().split(': ', 1)
+                      fields[key] = value
+                  index += 1
+              assert fields.get('encoding') == 'b64', (path, fields)
+              blocks[path] = base64.b64decode(fields['content'], validate=True)
+
+          expected_paths = {record['path'] for record in source['files']}
+          observed_paths = {
+              path.removeprefix('/opt/aef/bootstrap-source-v6/')
+              for path in blocks
+              if path.startswith('/opt/aef/bootstrap-source-v6/')
           }
+          assert observed_paths == expected_paths, (sorted(expected_paths - observed_paths), sorted(observed_paths - expected_paths))
+          manifest_path = '/etc/aef/bootstrap-source-v6.json'
+          assert blocks.get(manifest_path) == source_raw
 
-          assert artifact.startswith(b'#cloud-config\n')
-          assert len(artifact) == expected['artifact_bytes']
-          assert hashlib.sha256(artifact).hexdigest() == expected['artifact_sha256']
-          assert hashlib.sha256(manifest_bytes).hexdigest() == '45778b919d5aa1cece200580d313495eac5332a4a8221ede85de23ccc524850a'
+          root = Path(os.environ['SOURCE_DIR'])
+          root.mkdir(parents=True, exist_ok=True)
+          for record in source['files']:
+              data = blocks['/opt/aef/bootstrap-source-v6/' + record['path']]
+              assert len(data) == record['bytes'], record['path']
+              assert hashlib.sha256(data).hexdigest() == record['sha256'], record['path']
+              target = root / record['path']
+              target.parent.mkdir(parents=True, exist_ok=True)
+              target.write_bytes(data)
+              target.chmod(0o444)
+          Path(os.environ['SOURCE_MANIFEST']).write_bytes(source_raw)
 
-          forbidden = (
+          joined = '\n'.join(artifact)
+          assert '"--source-revision","5167f83b37aa8b2fc7c1ddab3ad6e6313eeca4b5"' in joined
+          PY
+
+      - name: Scan artifact and sources for credential values
+        env:
+          SOURCE_DIR: ${{ runner.temp }}/aef-v6-source
+        run: |
+          python3 - <<'PY'
+          import os
+          import re
+          from pathlib import Path
+
+          patterns = (
               re.compile(rb'ghp_[A-Za-z0-9]{20,}'),
               re.compile(rb'github_pat_[A-Za-z0-9_]{20,}'),
               re.compile(rb'-----BEGIN [A-Z ]*PRIVATE KEY-----'),
               re.compile(rb'DIGITALOCEAN_ACCESS_TOKEN\s*[=:]\s*[^\s"\']+'),
           )
-          for name, payload in ((artifact_path.name, artifact), (manifest_path.name, manifest_bytes)):
-              for pattern in forbidden:
-                  assert pattern.search(payload) is None, (name, pattern.pattern)
-          print(json.dumps({'status': 'PASS', 'source_revision': manifest['source_revision'], 'artifact_sha256': manifest['artifact_sha256']}, sort_keys=True))
+          targets = [Path('aef-worker-v6.yaml'), Path('aef-worker-v6-manifest.json'), Path('aef-worker-v6-source-manifest.json')]
+          targets.extend(path for path in Path(os.environ['SOURCE_DIR']).rglob('*') if path.is_file())
+          for path in targets:
+              data = path.read_bytes()
+              for pattern in patterns:
+                  assert pattern.search(data) is None, (str(path), pattern.pattern)
           PY
 
-      - name: Verify DigitalOcean immutable include transport
-        run: |
-          python3 - <<'PY'
-          import hashlib
-          import re
-          import urllib.request
-          from pathlib import Path
-
-          path = Path('aef-worker-v6-digitalocean-user-data.txt')
-          payload = path.read_bytes()
-          expected_url = 'https://raw.githubusercontent.com/sevranty/aef-bootstrap-public/d613cf39c8c967e618098d0f964a6ac515beee4a/aef-worker-v6.yaml'
-          expected_payload = ('#include\n' + expected_url).encode('ascii')
-          assert payload == expected_payload
-          assert len(payload) == 132
-          assert len(payload) <= 512
-          assert len(payload) <= 64 * 1024
-          assert hashlib.sha256(payload).hexdigest() == 'f44e2f93dd292bd75961ecfa5e005b8ee6fd3a4918c66a6cd0d1d3651c2b24a5'
-          assert not payload.endswith(b'\n')
-          assert re.fullmatch(rb'#include\nhttps://raw\.githubusercontent\.com/sevranty/aef-bootstrap-public/[0-9a-f]{40}/aef-worker-v6\.yaml', payload)
-
-          request = urllib.request.Request(expected_url, headers={'User-Agent': 'aef-public-v6-validator'})
-          with urllib.request.urlopen(request, timeout=30) as response:
-              target = response.read(382624)
-          assert len(target) == 382623
-          assert target.startswith(b'#cloud-config\n')
-          assert hashlib.sha256(target).hexdigest() == '99d41126f1499e376260c126be3b5807f7d99be1765a2145c28fd3ced179f6cf'
-          assert target == Path('aef-worker-v6.yaml').read_bytes()
-          print('DigitalOcean immutable include transport: PASS')
-          PY
-
-      - name: Reconstruct clean worker from public artifact only with auto-derived identity
+      - name: Parse every embedded Python module without mutation
         env:
-          PUBLIC_ROOT: ${{ runner.temp }}/aef-public-worker-v6
-          SOURCE_REVISION: 5966c258c4f90e0eb823282d080e84c37b895471
-          MACHINE_ID: 0123456789abcdef0123456789abcdef
+          SOURCE_DIR: ${{ runner.temp }}/aef-v6-source
         run: |
-          rm -rf "$PUBLIC_ROOT"
-          mkdir -p "$PUBLIC_ROOT"
           python3 - <<'PY'
-          import base64
+          import ast
           import os
           from pathlib import Path
-          import yaml
 
-          root = Path(os.environ['PUBLIC_ROOT'])
-          config = yaml.safe_load(Path('aef-worker-v6.yaml').read_text(encoding='utf-8'))
-          assert isinstance(config, dict)
-          assert config.get('package_update') is False
-          assert config.get('package_upgrade') is False
-          records = config.get('write_files')
-          assert isinstance(records, list) and records
-          for record in records:
-              canonical = Path(record['path'])
-              assert canonical.is_absolute()
-              target = root / canonical.relative_to('/')
-              target.parent.mkdir(parents=True, exist_ok=True)
-              raw = str(record['content']).encode('ascii')
-              payload = base64.b64decode(raw, validate=True) if record.get('encoding') == 'b64' else raw
-              target.write_bytes(payload)
-              target.chmod(int(str(record.get('permissions', '0644')), 8))
-          machine_id_path = root / 'etc/machine-id'
-          machine_id_path.parent.mkdir(parents=True, exist_ok=True)
-          machine_id_path.write_text(os.environ['MACHINE_ID'] + '\n', encoding='ascii')
-          machine_id_path.chmod(0o444)
+          root = Path(os.environ['SOURCE_DIR'])
+          for path in root.rglob('*.py'):
+              ast.parse(path.read_text(encoding='utf-8'), filename=str(path))
           PY
-          /usr/bin/python3 -I -B \
-            "$PUBLIC_ROOT/opt/aef/bootstrap-source-v6/bootstrap/aef_worker_v6_firstboot.py" \
-            --repository-root "$PUBLIC_ROOT/opt/aef/bootstrap-source-v6" \
-            --source-manifest "$PUBLIC_ROOT/etc/aef/bootstrap-source-v6.json" \
-            --source-revision "$SOURCE_REVISION" \
-            --root "$PUBLIC_ROOT" \
-            --synthetic > "$PUBLIC_ROOT/result.json"
-          PUBLIC_ROOT="$PUBLIC_ROOT" MACHINE_ID="$MACHINE_ID" python3 - <<'PY'
+
+      - name: Validate terminal REP191 and 180-second contracts
+        env:
+          SOURCE_DIR: ${{ runner.temp }}/aef-v6-source
+        run: |
+          python3 - <<'PY'
           import json
           import os
           from pathlib import Path
-          value = json.loads((Path(os.environ['PUBLIC_ROOT']) / 'result.json').read_text())
-          expected_worker_id = 'digitalocean-v6-' + os.environ['MACHINE_ID']
-          assert value['status'] == 'PASS', value
-          assert value['code'] == 'WORKER_V6_FIRSTBOOT_PASS', value
-          assert value['worker_id'] == expected_worker_id, value
-          assert value['reconstruction']['worker_id'] == expected_worker_id, value
-          assert value['reconstruction']['health']['state'] == 'READY', value
-          assert value['credential_values_present'] is False, value
-          assert value['remote_dispatch'] is False, value
-          assert value['scheduler_cutover'] is False, value
-          assert value['active_mode'] is False, value
-          assert value['protected_actions'] is False, value
-          print(json.dumps({'status': 'PASS', 'code': value['code'], 'state': 'READY', 'worker_id': value['worker_id']}, sort_keys=True))
+
+          root = Path(os.environ['SOURCE_DIR'])
+          registry = json.loads((root / 'registry/prepared-jobs-v2.json').read_text(encoding='utf-8'))
+          assert registry['dispatch_enabled'] is False
+          assert registry['registry_status'] == 'terminal-shadow-pass'
+          assert len(registry['jobs']) == 1
+          job = registry['jobs'][0]
+          assert job['requirements']['timeout_seconds'] == 180
+          assert job['schedule'] == {'interval_seconds': None, 'kind': 'manual'}
+          activation = job['activation']
+          assert activation['dispatch_enabled'] is False
+          assert activation['state'] == 'terminal-shadow-pass'
+          assert activation['shadow_execution_allowed'] is False
+          assert activation['terminal_shadow_run_id'] == '2c4888fa-624c-4471-8631-10b1b9189ea6'
+          assert all(value is False for value in job['safety'].values())
           PY
 
-      - name: Verify Git tree modes
+      - name: Reconstruct public-only clean synthetic worker
+        env:
+          SOURCE_DIR: ${{ runner.temp }}/aef-v6-source
+          SOURCE_MANIFEST: ${{ runner.temp }}/aef-v6-source-manifest.json
+          WORKER_ROOT: ${{ runner.temp }}/aef-v6-worker
         run: |
-          test "$(git ls-files -s aef-worker-v6.yaml | awk '{print $1}')" = "100644"
-          test "$(git ls-files -s aef-worker-v6-manifest.json | awk '{print $1}')" = "100644"
-          test "$(git ls-files -s aef-worker-v6-digitalocean-user-data.txt | awk '{print $1}')" = "100644"
+          mkdir -p "$WORKER_ROOT/etc"
+          printf '%s\n' '0123456789abcdef0123456789abcdef' > "$WORKER_ROOT/etc/machine-id"
+          /usr/bin/python3 -I -B "$SOURCE_DIR/bootstrap/aef_worker_v6_firstboot.py" \
+            --repository-root "$SOURCE_DIR" \
+            --source-manifest "$SOURCE_MANIFEST" \
+            --source-revision 5167f83b37aa8b2fc7c1ddab3ad6e6313eeca4b5 \
+            --root "$WORKER_ROOT" \
+            --synthetic | tee "${RUNNER_TEMP}/aef-v6-firstboot.json"
+          python3 - <<'PY'
+          import json
+          import os
+          import re
+          from pathlib import Path
+
+          value = json.loads((Path(os.environ['RUNNER_TEMP']) / 'aef-v6-firstboot.json').read_text(encoding='ascii'))
+          assert value['status'] == 'PASS', value
+          assert value['code'] == 'WORKER_V6_FIRSTBOOT_PASS', value
+          assert re.fullmatch(r'digitalocean-v6-[0-9a-f]{32}', value['worker_id'])
+          assert value['reconstruction']['health']['state'] == 'READY'
+          assert value['acceptance_codes'] == ['WORKER_STATUS_READY', 'WORKER_DOCTOR_PASS', 'WORKER_PREFLIGHT_PASS', 'JOB_INSPECT_READY']
+          assert value['max_workload_execution_seconds'] == 180
+          assert value['remote_hourly_scheduling'] is False
+          assert value['worker_service_recurring'] is False
+          assert value['worker_service_polling'] is False
+          assert value['remote_dispatch'] is False
+          assert value['scheduler_cutover'] is False
+          assert value['active_mode'] is False
+          assert value['protected_actions'] is False
+
+          worker = Path(os.environ['WORKER_ROOT'])
+          unit = (worker / 'etc/systemd/system/aef-worker-v6.service').read_text(encoding='ascii')
+          assert 'Type=oneshot' in unit
+          assert '--once' in unit
+          assert 'RemainAfterExit=no' in unit
+          assert 'Restart=' not in unit
+          assert '[Install]' not in unit
+          assert 'WantedBy=' not in unit
+          prepared = json.loads((worker / 'etc/aef/prepared-jobs.json').read_text(encoding='ascii'))
+          assert prepared['registry_status'] == 'terminal-shadow-pass'
+          assert prepared['jobs'][0]['requirements']['timeout_seconds'] == 180
+          assert prepared['jobs'][0]['activation']['shadow_execution_allowed'] is False
+          PY
+
+      - name: Verify exact declared GitHub CLI capability asset
+        env:
+          SOURCE_DIR: ${{ runner.temp }}/aef-v6-source
+        run: |
+          python3 - <<'PY'
+          import hashlib
+          import io
+          import json
+          import os
+          import subprocess
+          import tarfile
+          import tempfile
+          import urllib.request
+          from pathlib import Path
+
+          registry = json.loads((Path(os.environ['SOURCE_DIR']) / 'registry/capabilities-v2.json').read_text(encoding='utf-8'))
+          cap = next(item for item in registry['capabilities'] if item['capability_id'] == 'github-cli')
+          source = cap['source']
+          request = urllib.request.Request(source['url'], headers={'User-Agent': 'aef-public-v6'})
+          with urllib.request.urlopen(request, timeout=60) as response:
+              data = response.read(source['bytes'] + 1)
+          assert len(data) == source['bytes']
+          assert hashlib.sha256(data).hexdigest() == source['sha256']
+          with tarfile.open(fileobj=io.BytesIO(data), mode='r:gz') as bundle:
+              member = bundle.getmember(source['archive_member'])
+              assert member.isfile() and not member.issym() and not member.islnk()
+              handle = bundle.extractfile(member)
+              assert handle is not None
+              binary = handle.read(member.size + 1)
+          assert hashlib.sha256(binary).hexdigest() == source['member_sha256']
+          with tempfile.TemporaryDirectory() as temp:
+              path = Path(temp) / 'gh'
+              path.write_bytes(binary)
+              path.chmod(0o555)
+              result = subprocess.run(
+                  [str(path), '--version'],
+                  stdin=subprocess.DEVNULL,
+                  stdout=subprocess.PIPE,
+                  stderr=subprocess.STDOUT,
+                  text=True,
+                  timeout=15,
+                  check=False,
+                  env={'PATH': '/usr/bin:/bin', 'HOME': '/nonexistent', 'NO_COLOR': '1'},
+              )
+          assert result.returncode == 0
+          assert result.stdout.splitlines()[0].startswith(f"gh version {cap['version']} ")
+          PY
