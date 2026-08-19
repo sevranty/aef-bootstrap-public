@@ -1,0 +1,56 @@
+name: Stage AEF-PUBLIC#19 artifact
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - '.staging/aef-public-19/**'
+      - '.github/workflows/aef-public-19-stage-artifact.yml'
+
+permissions:
+  contents: write
+
+concurrency:
+  group: aef-public-19-stage-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  stage:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: Checkout exact staging branch
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.pull_request.head.ref }}
+          persist-credentials: true
+
+      - name: Verify staging identity
+        env:
+          HEAD_REF: ${{ github.event.pull_request.head.ref }}
+        run: |
+          test "$HEAD_REF" = "staging/aef-public-19-artifact"
+          test "$(git rev-parse --abbrev-ref HEAD)" = "$HEAD_REF"
+
+      - name: Reconstruct exact artifact
+        run: |
+          cat .staging/aef-public-19/part-*.b64 | base64 --decode > /tmp/aef-worker-v6.yaml.xz
+          test "$(stat -c %s /tmp/aef-worker-v6.yaml.xz)" = "70064"
+          test "$(sha256sum /tmp/aef-worker-v6.yaml.xz | cut -d' ' -f1)" = "4cdece664732c0e4be4b54fd655250aeca65b34f480e639b5c3dfa54dfed1a4d"
+          xz -dc /tmp/aef-worker-v6.yaml.xz > aef-worker-v6.yaml
+          test "$(stat -c %s aef-worker-v6.yaml)" = "391223"
+          test "$(sha256sum aef-worker-v6.yaml | cut -d' ' -f1)" = "d986ee5a6ce19c09f809cbc111068b4b94cd4bd0dbc01a280886ee906e5938e3"
+
+      - name: Commit transport result only when changed
+        env:
+          HEAD_REF: ${{ github.event.pull_request.head.ref }}
+        run: |
+          if git diff --quiet -- aef-worker-v6.yaml; then
+            echo "exact artifact already staged"
+            exit 0
+          fi
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git add aef-worker-v6.yaml
+          git commit -m "AEF-PUBLIC#19: stage exact worker v6 artifact"
+          git push origin "HEAD:${HEAD_REF}"
