@@ -46,10 +46,12 @@ jobs:
           test -f aef-worker-v6.yaml
           test -f aef-worker-v6-manifest.json
           test -f aef-worker-v6-source-manifest.json
-          test ! -e aef-worker-v6-digitalocean-user-data.txt
+          test -f aef-worker-v6-digitalocean-user-data.txt
           test "$(stat -c %s aef-worker-v6.yaml)" = "391223"
           test "$(sha256sum aef-worker-v6.yaml | cut -d' ' -f1)" = "d986ee5a6ce19c09f809cbc111068b4b94cd4bd0dbc01a280886ee906e5938e3"
           test "$(sha256sum aef-worker-v6-source-manifest.json | cut -d' ' -f1)" = "5d8c9be157eb81536012e22e04285fb1290fcd7ce7e72f28500740c72ce998ac"
+          test "$(stat -c %s aef-worker-v6-digitalocean-user-data.txt)" = "132"
+          test "$(sha256sum aef-worker-v6-digitalocean-user-data.txt | cut -d' ' -f1)" = "ef910bf28f5938d4b7ebde2d9177779932b402ac3dec3e3c639b6b8a6905a37e"
           python3 - <<'PY'
           import hashlib
           import json
@@ -58,6 +60,13 @@ jobs:
           manifest = json.loads(Path('aef-worker-v6-manifest.json').read_text(encoding='ascii'))
           source_raw = Path('aef-worker-v6-source-manifest.json').read_bytes()
           source = json.loads(source_raw.decode('ascii'))
+          provider = Path('aef-worker-v6-digitalocean-user-data.txt').read_bytes()
+          provider_expected = b'#include\nhttps://raw.githubusercontent.com/sevranty/aef-bootstrap-public/8cebffb9330b72e0b25474d92e34bfa27bcc50b3/aef-worker-v6.yaml'
+          assert provider == provider_expected
+          assert not provider.endswith(b'\n')
+          assert len(provider) == 132
+          assert hashlib.sha256(provider).hexdigest() == 'ef910bf28f5938d4b7ebde2d9177779932b402ac3dec3e3c639b6b8a6905a37e'
+
           expected = {
               'schema_version': 6,
               'task_id': 'AEF#61',
@@ -105,6 +114,15 @@ jobs:
           assert declared_inventory == expected['source_inventory_sha256']
           assert hashlib.sha256(source_raw).hexdigest() == expected['source_manifest_sha256']
           PY
+
+      - name: Verify immutable provider target network readback
+        run: |
+          curl --fail --silent --show-error --location --proto '=https' --tlsv1.2 --max-time 60 \
+            'https://raw.githubusercontent.com/sevranty/aef-bootstrap-public/8cebffb9330b72e0b25474d92e34bfa27bcc50b3/aef-worker-v6.yaml' \
+            --output "${RUNNER_TEMP}/aef-worker-v6-network-readback.yaml"
+          test "$(stat -c %s "${RUNNER_TEMP}/aef-worker-v6-network-readback.yaml")" = "391223"
+          test "$(sha256sum "${RUNNER_TEMP}/aef-worker-v6-network-readback.yaml" | cut -d' ' -f1)" = "d986ee5a6ce19c09f809cbc111068b4b94cd4bd0dbc01a280886ee906e5938e3"
+          cmp --silent aef-worker-v6.yaml "${RUNNER_TEMP}/aef-worker-v6-network-readback.yaml"
 
       - name: Extract and verify closed embedded source set
         env:
@@ -181,7 +199,7 @@ jobs:
               re.compile(rb'-----BEGIN [A-Z ]*PRIVATE KEY-----'),
               re.compile(rb'DIGITALOCEAN_ACCESS_TOKEN\s*[=:]\s*[^\s"\']+'),
           )
-          targets = [Path('aef-worker-v6.yaml'), Path('aef-worker-v6-manifest.json'), Path('aef-worker-v6-source-manifest.json')]
+          targets = [Path('aef-worker-v6.yaml'), Path('aef-worker-v6-manifest.json'), Path('aef-worker-v6-source-manifest.json'), Path('aef-worker-v6-digitalocean-user-data.txt')]
           targets.extend(path for path in Path(os.environ['SOURCE_DIR']).rglob('*') if path.is_file())
           for path in targets:
               data = path.read_bytes()
