@@ -1,0 +1,23 @@
+when:
+  - event: pull_request
+  - event: push
+    branch: ${CI_REPO_DEFAULT_BRANCH}
+
+# ABP#26: repository-local Woodpecker execution contract.
+clone:
+  - name: git
+    image: woodpeckerci/plugin-git
+    settings:
+      partial: false
+      depth: 0
+
+steps:
+  - name: repository-integrity
+    image: alpine/git:2.47.2
+    commands:
+      - git diff --check
+      - git fsck --no-progress
+      - 'test -n "$(git ls-files | head -n 1)"'
+      - 'test -z "$(git status --porcelain)"'
+
+concurrency: 1
